@@ -1,9 +1,13 @@
 [project]
 name = "silent-loss-detector"
 version = "0.1.0"
-description = "Add your description here"
+description = "Wind Farm Turbine Investigation Application for detecting silent non-production issues"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dash>=3.0.4",
+    "dash-bootstrap-components>=2.0.3",
+    "numpy>=2.2.6",
+    "pandas>=2.2.3",
+    "plotly>=6.1.2",
 ]
