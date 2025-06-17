@@ -6,7 +6,7 @@ from dash import Input, Output, State, callback, ctx
 import base64
 import io
 import logging
-import os  # For temporary file operations
+import os
 from datetime import timedelta
 import pandas as pd
 
@@ -115,6 +115,8 @@ def _process_uploaded_layout_file(decoded_content: bytes, filename: str, data_lo
 def handle_data_upload(contents, filename):
     """Handle main data file upload."""
     logger = logging.getLogger("callbacks.data_upload")
+    # Import datetime here for the new timestamp
+    from datetime import datetime
 
     if contents is None:
         logger.debug("No file contents provided")
@@ -129,20 +131,31 @@ def handle_data_upload(contents, filename):
         decoded = base64.b64decode(content_string)
         logger.debug(f"File decoded, size: {len(decoded)} bytes")
 
-        # Call helper function for file processing
-        success, message, data_dict, summary = _process_uploaded_file(
+        # _process_uploaded_file ALREADY updates data_loader.data internally
+        success, message, _processed_data_dict_from_helper, summary = _process_uploaded_file(
             decoded, filename, data_loader, state_classifier
         )
+        # We will IGNORE _processed_data_dict_from_helper["data"] for the data-store output.
+        # The full data is now in data_loader.data on the server.
 
         if success:
+            # Create a lightweight dictionary for data-store
+            store_payload = {
+                "summary": summary, # summary is already suitable (timestamps stringified in helper)
+                "data_loaded_timestamp": datetime.now().isoformat() # New signal
+            }
+            
+            record_count = summary.get('total_records', 0)
+            turbine_count = summary.get('unique_turbines', 0)
+
             log_user_action("File upload completed successfully", {
                 "filename": filename,
-                "records": len(data_dict.get("data", [])),
-                "turbines": len(pd.DataFrame(data_dict.get("data", [])).get('StationId', pd.Series([])).unique()) if data_dict.get("data") else 0
+                "records": record_count,
+                "turbines": turbine_count
             })
-            return (f"✅ {message}", data_dict, create_data_summary_display(summary))
+            success_message = f"Successfully loaded {record_count} records from {turbine_count} turbines"
+            return (f"✅ {success_message}", store_payload, create_data_summary_display(summary))
         else:
-            # Error already logged by helper or load_pkl_data
             log_user_action("File upload failed", {"filename": filename, "error": message})
             return f"❌ {message}", {}, "Failed to load data"
 
@@ -217,45 +230,60 @@ def handle_layout_upload(contents, filename):
     prevent_initial_call=True,
 )
 def update_date_range(btn_24h, btn_7d, btn_30d, btn_all, data_store):
-    """Update date range based on button clicks or data loading."""
-    if not data_store:
+    """Update date range based on button clicks or data loading.
+       Ensures NaT values from summary are handled gracefully.
+    """
+    if not data_store or "summary" not in data_store:
         return None, None
 
     summary = data_store.get("summary", {})
-    time_range = summary.get("time_range")
+    time_range_str_tuple = summary.get("time_range")
 
-    if not time_range or not time_range[0] or not time_range[1]:
+    if not time_range_str_tuple or not time_range_str_tuple[0] or not time_range_str_tuple[1]:
         return None, None
 
-    # Convert string timestamps back to datetime objects
-    if isinstance(time_range[0], str):
-        start_time = pd.to_datetime(time_range[0])
-        end_time = pd.to_datetime(time_range[1])
-    else:
-        start_time = time_range[0]
-        end_time = time_range[1]
+    try:
+        min_ts_from_data = pd.to_datetime(time_range_str_tuple[0], errors='coerce')
+        max_ts_from_data = pd.to_datetime(time_range_str_tuple[1], errors='coerce')
+    except Exception: # Catch any parsing errors
+        return None, None
+
+    if pd.isna(max_ts_from_data):
+        return None, None
+
+    end_date_dt = max_ts_from_data
 
     # Determine which button was clicked
     triggered_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
+    is_data_load_trigger = any(item['prop_id'] == 'data-store.data' for item in ctx.triggered) if ctx.triggered else False
 
     if triggered_id == "btn-24h":
-        start_date = end_time - timedelta(hours=24)
+        start_date_dt = end_date_dt - timedelta(hours=24)
     elif triggered_id == "btn-7d":
-        start_date = end_time - timedelta(days=7)
+        start_date_dt = end_date_dt - timedelta(days=7)
     elif triggered_id == "btn-30d":
-        start_date = end_time - timedelta(days=30)
+        start_date_dt = end_date_dt - timedelta(days=30)
     elif triggered_id == "btn-all":
-        start_date = start_time
+        if pd.isna(min_ts_from_data):
+            return None, None
+        start_date_dt = min_ts_from_data
+    elif is_data_load_trigger and (not triggered_id or not triggered_id.startswith("btn-")):
+        # Default to last 24 hours when data is first loaded and no specific button was the primary trigger
+        start_date_dt = end_date_dt - timedelta(hours=24)
     else:
-        # Default to last 24 hours when data is first loaded
-        start_date = end_time - timedelta(hours=24)
+        # Fallback or if a button was clicked (already handled above)
+        # If triggered_id is a button, it's fine. If not, default.
+        start_date_dt = end_date_dt - timedelta(hours=24)
 
-    return start_date.date(), end_time.date()
+    if pd.isna(start_date_dt):
+        return None, None
+
+    return start_date_dt.date(), end_date_dt.date()
 
 
 @callback(
     [
-        Output("filtered-data-store", "data"),
+        Output("filter-params-store", "data"), # Changed Output
         Output("state-summary-cards", "children"),
         Output("turbine-table", "data"),
     ],
@@ -263,49 +291,63 @@ def update_date_range(btn_24h, btn_7d, btn_30d, btn_all, data_store):
         Input("date-picker-range", "start_date"),
         Input("date-picker-range", "end_date"),
         Input("state-filter", "value"),
-        Input("data-store", "data"),
+        Input("data-store", "data"), # This now contains summary and timestamp
     ],
 )
 def update_filtered_data(start_date, end_date, state_filter, data_store):
-    """Update filtered data based on date range and state filter."""
-    if not data_store or not start_date or not end_date:
+    """Update filtered data based on date range and state filter.
+    'filter-params-store' will hold current filter parameters.
+    """
+    logger = logging.getLogger("callbacks.update_filtered_data")
+    if not data_loader.data_loaded or data_loader.data is None or data_loader.data.empty or not start_date or not end_date:
         return {}, "No data to display", []
 
     try:
-        # Convert data back to DataFrame
-        df = pd.DataFrame(data_store["data"])
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+
+        # Access the full DataFrame from the global data_loader instance
+        df = data_loader.data
+        if not pd.api.types.is_datetime64_any_dtype(df['TimeStamp']):
+             df['TimeStamp'] = pd.to_datetime(df['TimeStamp']) # Should be redundant
 
         # Filter by date range
         start_datetime = pd.to_datetime(start_date)
         end_datetime = pd.to_datetime(end_date) + timedelta(days=1)  # Include end date
 
-        filtered_df = df[
+        filtered_df_by_date = df[
             (df["TimeStamp"] >= start_datetime) & (df["TimeStamp"] < end_datetime)
         ]
 
+        if filtered_df_by_date.empty:
+            return {"start_date": start_date, "end_date": end_date, "visible_turbine_ids": []}, "No data within selected date range", []
+
         # Get latest state for each turbine
-        latest_states = filtered_df.groupby("StationId").last().reset_index()
+        latest_states_in_range = filtered_df_by_date.loc[filtered_df_by_date.groupby("StationId")["TimeStamp"].idxmax()]
 
         # Filter by operational state if specified
         if state_filter and state_filter != "ALL":
-            latest_states = latest_states[
-                latest_states["operational_state"] == state_filter
+            latest_states_in_range = latest_states_in_range[
+                latest_states_in_range["operational_state"] == state_filter
             ]
+        
+        visible_turbine_ids = latest_states_in_range['StationId'].tolist() if not latest_states_in_range.empty else []
+
+        if latest_states_in_range.empty and state_filter and state_filter != "ALL":
+             filter_params_payload = {"start_date": start_date, "end_date": end_date, "visible_turbine_ids": []}
+             return filter_params_payload, f"No turbines in '{OPERATIONAL_STATES.get(state_filter, {}).get('name', state_filter)}' state for selected date range", []
 
         # Calculate state summary
         state_counts = {}
-        total_turbines = len(latest_states)
+        total_turbines_in_selection = len(latest_states_in_range)
 
         for state_key in OPERATIONAL_STATES.keys():
-            count = len(latest_states[latest_states["operational_state"] == state_key])
+            count = len(latest_states_in_range[latest_states_in_range["operational_state"] == state_key])
             state_counts[state_key] = count
             state_counts[f"{state_key}_pct"] = (
-                (count / total_turbines * 100) if total_turbines > 0 else 0
+                (count / total_turbines_in_selection * 100) if total_turbines_in_selection > 0 else 0
             )
 
         # Prepare table data
-        table_data = latest_states[
+        table_data_df = latest_states_in_range[
             [
                 "StationId",
                 "state_category",
@@ -315,22 +357,26 @@ def update_filtered_data(start_date, end_date, state_filter, data_store):
                 "TimeStamp",
                 "state_reason",
             ]
-        ].to_dict("records")
+        ].copy()
 
         # Format timestamps for display
-        for row in table_data:
-            if row["TimeStamp"]:
-                row["TimeStamp"] = pd.to_datetime(row["TimeStamp"]).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+        table_data_df["TimeStamp"] = table_data_df["TimeStamp"].dt.strftime("%Y-%m-%d %H:%M")
+        table_data = table_data_df.to_dict("records")
+
+        filter_params_payload = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "visible_turbine_ids": visible_turbine_ids
+        }
 
         return (
-            filtered_df.to_dict("records"),
+            filter_params_payload,
             create_state_summary_cards(state_counts),
             table_data,
         )
 
     except Exception as e:
+        logger.error(f"Error in update_filtered_data: {str(e)}", exc_info=True)
         return {}, f"Error filtering data: {str(e)}", []
 
 
@@ -341,11 +387,11 @@ def update_filtered_data(start_date, end_date, state_filter, data_store):
         Output("investigation-panel", "style"),
     ],
     [Input("turbine-table", "selected_rows")],
-    [State("turbine-table", "data"), State("filtered-data-store", "data")],
+    [State("turbine-table", "data")], # No longer need filtered-data-store here
     prevent_initial_call=True,
 )
 @log_callback_execution
-def handle_turbine_selection(selected_rows, table_data, filtered_data):
+def handle_turbine_selection(selected_rows, table_data):
     """Handle turbine selection and show/hide investigation panel."""
     from ..layouts.investigation_panel import create_investigation_panel_layout
 
@@ -461,27 +507,54 @@ def update_metmast_options(selected_turbine, data_store):
 @callback(
     Output('export-data-btn', 'children'),
     [Input('export-data-btn', 'n_clicks')],
-    [State('filtered-data-store', 'data')],
+    [State('filter-params-store', 'data')], # Changed from filtered-data-store
     prevent_initial_call=True
 )
-def export_data(n_clicks, filtered_data):
-    """Export filtered data to CSV."""
-    if n_clicks and filtered_data:
-        try:
-            # Convert to DataFrame
-            df = pd.DataFrame(filtered_data)
+def export_data(n_clicks, filter_params):
+    """Export filtered data (latest states within date range) to CSV."""
+    logger = logging.getLogger("callbacks.export_data")
+    if not n_clicks or not filter_params:
+        return "📊 Export Data"
 
-            # Generate filename with timestamp
-            from datetime import datetime
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"turbine_data_export_{timestamp}.csv"
+    if not data_loader.data_loaded or data_loader.data is None or data_loader.data.empty:
+        logger.warning("Export attempted but no data loaded in data_loader.")
+        return "❌ No data to export"
 
-            # Export to CSV
-            df.to_csv(filename, index=False)
+    start_date_str = filter_params.get("start_date")
+    end_date_str = filter_params.get("end_date")
+    # visible_turbine_ids = filter_params.get("visible_turbine_ids") # Could be used for more precise export
 
-            return f"✅ Exported to {filename}"
+    if not start_date_str or not end_date_str:
+        logger.warning("Export attempted but date range not found in filter_params.")
+        return "❌ Date range not set"
 
-        except Exception as e:
-            return f"❌ Export failed: {str(e)}"
+    try:
+        df_to_export = data_loader.data.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df_to_export['TimeStamp']):
+            df_to_export['TimeStamp'] = pd.to_datetime(df_to_export['TimeStamp'])
 
-    return "📊 Export Data"
+        start_datetime = pd.to_datetime(start_date_str)
+        end_datetime = pd.to_datetime(end_date_str) + timedelta(days=1)
+
+        # Filter by date range
+        df_filtered_by_date = df_to_export[
+            (df_to_export["TimeStamp"] >= start_datetime) & (df_to_export["TimeStamp"] < end_datetime)
+        ]
+
+        if df_filtered_by_date.empty:
+            return "ℹ️ No data in selected range to export"
+
+        # For simplicity, exporting all columns of the latest states, similar to turbine-table logic
+        # If you need all records, not just latest states, remove the groupby().last()
+        latest_states_to_export = df_filtered_by_date.loc[df_filtered_by_date.groupby("StationId")["TimeStamp"].idxmax()]
+
+        from datetime import datetime
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"turbine_data_export_{timestamp_str}.csv"
+        latest_states_to_export.to_csv(filename, index=False)
+        logger.info(f"Data exported successfully to {filename}")
+        return f"✅ Exported to {filename}"
+
+    except Exception as e:
+        logger.error(f"Error during data export: {str(e)}", exc_info=True)
+        return f"❌ Export failed: {str(e)}"

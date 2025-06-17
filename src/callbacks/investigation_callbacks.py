@@ -1,12 +1,14 @@
 """
 Investigation panel callbacks for detailed turbine analysis.
 """
-
+import logging # Add logging
 from dash import Input, Output, State, callback, ctx, html
 import pandas as pd
 from datetime import timedelta
 import plotly.graph_objects as go
 
+# Import the global data_loader instance
+from ..callbacks.main_callbacks import data_loader
 from ..layouts.investigation_panel import (
     create_power_analysis_chart,
     create_wind_comparison_chart,
@@ -14,31 +16,47 @@ from ..layouts.investigation_panel import (
 )
 from ..utils.config import OPERATIONAL_STATES
 
+logger = logging.getLogger(__name__) # Add a logger for this module
 
 @callback(
     [
         Output("selected-turbine-status", "children"),
         Output("selected-turbine-metrics", "children"),
     ],
-    [Input("selected-turbine-store", "data")],
-    [State("filtered-data-store", "data")],
+    [Input("selected-turbine-store", "data")], # This is the selected_turbine_id
+    [
+        State("date-picker-range", "start_date"),
+        State("date-picker-range", "end_date")
+    ]
 )
-def update_turbine_status_and_metrics(selected_turbine, filtered_data):
+def update_turbine_status_and_metrics(selected_turbine_id, start_date_str, end_date_str):
     """Update selected turbine status and key metrics."""
-    if not selected_turbine or not filtered_data:
+    if not selected_turbine_id or not start_date_str or not end_date_str:
         return "No turbine selected", "No data available"
 
     try:
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+        if not data_loader.data_loaded or data_loader.data is None:
+            return "Overall data not loaded", "No data available"
 
-        # Get latest data for selected turbine
-        turbine_data = df[df["StationId"] == selected_turbine]
-        if turbine_data.empty:
-            return "No data for selected turbine", "No data available"
+        turbine_full_history_df = data_loader.get_turbine_data(selected_turbine_id)
+        if turbine_full_history_df.empty:
+            return f"No historical data for turbine {selected_turbine_id}", "No data available"
 
-        latest_data = turbine_data.iloc[-1]
+        if not pd.api.types.is_datetime64_any_dtype(turbine_full_history_df['TimeStamp']):
+            turbine_full_history_df['TimeStamp'] = pd.to_datetime(turbine_full_history_df['TimeStamp'])
+
+        start_datetime = pd.to_datetime(start_date_str)
+        end_datetime = pd.to_datetime(end_date_str) + timedelta(days=1)
+
+        turbine_data_in_range = turbine_full_history_df[
+            (turbine_full_history_df["TimeStamp"] >= start_datetime) &
+            (turbine_full_history_df["TimeStamp"] < end_datetime)
+        ]
+
+        if turbine_data_in_range.empty:
+            return f"No data for {selected_turbine_id} in selected date range", "No data available"
+
+        latest_data = turbine_data_in_range.sort_values(by="TimeStamp", ascending=False).iloc[0]
 
         # Status display
         state_info = OPERATIONAL_STATES.get(latest_data["operational_state"], {})
@@ -107,31 +125,40 @@ def update_turbine_status_and_metrics(selected_turbine, filtered_data):
         return status_content, metrics_content
 
     except Exception as e:
+        logger.error(f"Error in update_turbine_status_and_metrics: {str(e)}", exc_info=True)
         return f"Error: {str(e)}", "Error loading metrics"
 
 
 @callback(
     Output("power-analysis-chart", "figure"),
     [
-        Input("selected-turbine-store", "data"),
+        Input("selected-turbine-store", "data"), # selected_turbine_id
         Input("power-24h", "n_clicks"),
         Input("power-7d", "n_clicks"),
         Input("power-30d", "n_clicks"),
         Input("adjacent-turbines-selector", "value"),
     ],
-    [State("filtered-data-store", "data")],
+    [
+        State("date-picker-range", "start_date"), # Use main date pickers for overall range
+        State("date-picker-range", "end_date")
+    ]
 )
 def update_power_analysis_chart(
-    selected_turbine, btn_24h, btn_7d, btn_30d, adjacent_turbines, filtered_data
+    selected_turbine_id, btn_24h, btn_7d, btn_30d, adjacent_turbine_ids,
+    filter_start_date_str, filter_end_date_str
 ):
     """Update power analysis chart."""
-    if not selected_turbine or not filtered_data:
+    if not selected_turbine_id:
         return go.Figure()
 
+    if not data_loader.data_loaded or data_loader.data is None:
+        return go.Figure().add_annotation(text="Overall data not loaded", showarrow=False)
+
     try:
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+        # Fetch all data for the selected turbine and adjacent ones
+        df_all_turbines = data_loader.data # Full dataset
+        if not pd.api.types.is_datetime64_any_dtype(df_all_turbines['TimeStamp']):
+            df_all_turbines['TimeStamp'] = pd.to_datetime(df_all_turbines['TimeStamp'])
 
         # Determine time range
         triggered_id = (
@@ -147,29 +174,39 @@ def update_power_analysis_chart(
         else:
             hours = 24  # Default
 
-        # Filter data by time range
-        end_time = df["TimeStamp"].max()
-        start_time = end_time - timedelta(hours=hours)
-        time_filtered_df = df[df["TimeStamp"] >= start_time]
+        # The chart's time range should be relative to the latest data point of the selected turbine
+        # within the dashboard's overall filtered date range.
+        selected_turbine_history = df_all_turbines[df_all_turbines["StationId"] == selected_turbine_id]
+        if selected_turbine_history.empty:
+            return go.Figure().add_annotation(text=f"No data for turbine {selected_turbine_id}", showarrow=False)
 
-        # Get turbine data
-        turbine_data = time_filtered_df[
-            time_filtered_df["StationId"] == selected_turbine
+        # Determine the end_time for the chart (latest timestamp for the turbine)
+        chart_end_time = selected_turbine_history["TimeStamp"].max()
+        chart_start_time = chart_end_time - timedelta(hours=hours)
+
+        # Filter data for the chart's specific time window
+        chart_time_filtered_df = df_all_turbines[
+            (df_all_turbines["TimeStamp"] >= chart_start_time) & (df_all_turbines["TimeStamp"] <= chart_end_time)
+        ]
+
+        turbine_data_for_chart = chart_time_filtered_df[
+            chart_time_filtered_df["StationId"] == selected_turbine_id
         ]
 
         # Get adjacent turbine data
         adjacent_data = None
-        if adjacent_turbines:
-            adjacent_data = time_filtered_df[
-                time_filtered_df["StationId"].isin(adjacent_turbines)
+        if adjacent_turbine_ids:
+            adjacent_data = chart_time_filtered_df[
+                chart_time_filtered_df["StationId"].isin(adjacent_turbine_ids)
             ]
 
         # Create chart
-        fig = create_power_analysis_chart(turbine_data, adjacent_data, hours)
+        fig = create_power_analysis_chart(turbine_data_for_chart, adjacent_data, hours)
 
         return fig
 
     except Exception as e:
+        logger.error(f"Error in update_power_analysis_chart: {str(e)}", exc_info=True)
         return go.Figure().add_annotation(
             text=f"Error: {str(e)}",
             xref="paper",
@@ -178,6 +215,21 @@ def update_power_analysis_chart(
             y=0.5,
             showarrow=False,
         )
+
+# IMPORTANT: You'll need to apply a similar refactoring pattern (as shown in update_power_analysis_chart)
+# to the following investigation panel callbacks:
+# - update_wind_comparison_chart
+# - update_alarm_curtailment_chart
+# - update_anomaly_analysis
+# - update_detailed_data_table
+#
+# They all need to:
+# 1. Remove `State("filtered-data-store", "data")`.
+# 2. Potentially use `State("date-picker-range", "start_date")` and `State("date-picker-range", "end_date")`
+#    if they need to respect the main dashboard's date filter, or calculate their own time windows
+#    based on button clicks (24h, 7d, 30d) relative to the turbine's latest data.
+# 3. Fetch data directly from `data_loader.data` using `selected_turbine_id` and then filter/process it.
+# 4. Handle cases where `data_loader.data` might not be loaded.
 
 
 @callback(
@@ -190,26 +242,34 @@ def update_power_analysis_chart(
         Input("adjacent-turbines-selector", "value"),
         Input("metmast-selector", "value"),
     ],
-    [State("filtered-data-store", "data")],
+    [
+        State("date-picker-range", "start_date"),
+        State("date-picker-range", "end_date")
+    ]
 )
 def update_wind_comparison_chart(
-    selected_turbine,
+    selected_turbine_id, # Renamed for clarity and consistency
     btn_24h,
     btn_7d,
     btn_30d,
-    adjacent_turbines,
+    adjacent_turbine_ids, # Renamed for clarity and consistency
     metmast_columns,
-    filtered_data,
+    filter_start_date_str, # Correctly mapped from State
+    filter_end_date_str    # Correctly mapped from State
 ):
     """Update wind speed comparison chart."""
-    if not selected_turbine or not filtered_data:
+    if not selected_turbine_id:
         return go.Figure()
+    
+    if not data_loader.data_loaded or data_loader.data is None:
+        return go.Figure().add_annotation(text="Overall data not loaded", showarrow=False)
+    # Note: filter_start_date_str and filter_end_date_str are available if needed to constrain chart context
 
     try:
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
-
+        df_all_turbines = data_loader.data
+        if not pd.api.types.is_datetime64_any_dtype(df_all_turbines['TimeStamp']):
+            df_all_turbines['TimeStamp'] = pd.to_datetime(df_all_turbines['TimeStamp'])
+        
         # Determine time range
         triggered_id = (
             ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
@@ -224,36 +284,44 @@ def update_wind_comparison_chart(
         else:
             hours = 24  # Default
 
-        # Filter data by time range
-        end_time = df["TimeStamp"].max()
-        start_time = end_time - timedelta(hours=hours)
-        time_filtered_df = df[df["TimeStamp"] >= start_time]
+        selected_turbine_history = df_all_turbines[df_all_turbines["StationId"] == selected_turbine_id]
+        if selected_turbine_history.empty:
+            return go.Figure().add_annotation(text=f"No data for turbine {selected_turbine_id}", showarrow=False)
 
-        # Get turbine data
-        turbine_data = time_filtered_df[
-            time_filtered_df["StationId"] == selected_turbine
+        chart_end_time = selected_turbine_history["TimeStamp"].max()
+        chart_start_time = chart_end_time - timedelta(hours=hours)
+
+        chart_time_filtered_df = df_all_turbines[
+            (df_all_turbines["TimeStamp"] >= chart_start_time) & (df_all_turbines["TimeStamp"] <= chart_end_time)
+        ]
+
+        turbine_data_for_chart = chart_time_filtered_df[
+            chart_time_filtered_df["StationId"] == selected_turbine_id
         ]
 
         # Get adjacent turbine data
         adjacent_data = None
-        if adjacent_turbines:
-            adjacent_data = time_filtered_df[
-                time_filtered_df["StationId"].isin(adjacent_turbines)
+        if adjacent_turbine_ids:
+            adjacent_data = chart_time_filtered_df[
+                chart_time_filtered_df["StationId"].isin(adjacent_turbine_ids)
             ]
 
         # Get metmast data
         metmast_data = None
         if metmast_columns:
-            metmast_data = time_filtered_df.set_index("TimeStamp")[
+            # Metmast data should also be filtered by the chart's time window
+            metmast_data_for_chart = chart_time_filtered_df.set_index("TimeStamp")[
                 metmast_columns
             ].dropna()
+            metmast_data = metmast_data_for_chart # Assign to the variable used by create_wind_comparison_chart
 
         # Create chart
-        fig = create_wind_comparison_chart(turbine_data, adjacent_data, metmast_data)
+        fig = create_wind_comparison_chart(turbine_data_for_chart, adjacent_data, metmast_data)
 
         return fig
 
     except Exception as e:
+        logger.error(f"Error in update_wind_comparison_chart: {str(e)}", exc_info=True)
         return go.Figure().add_annotation(
             text=f"Error: {str(e)}",
             xref="paper",
@@ -266,21 +334,37 @@ def update_wind_comparison_chart(
 
 @callback(
     Output("alarm-curtailment-chart", "figure"),
-    [Input("selected-turbine-store", "data")],
-    [State("filtered-data-store", "data")],
+    [Input("selected-turbine-store", "data")], # selected_turbine_id
+    [
+        State("date-picker-range", "start_date"),
+        State("date-picker-range", "end_date")
+    ]
 )
-def update_alarm_curtailment_chart(selected_turbine, filtered_data):
+def update_alarm_curtailment_chart(selected_turbine_id, filter_start_date_str, filter_end_date_str):
     """Update alarm and curtailment chart."""
-    if not selected_turbine or not filtered_data:
+    if not selected_turbine_id or not filter_start_date_str or not filter_end_date_str:
         return go.Figure()
 
-    try:
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+    if not data_loader.data_loaded or data_loader.data is None:
+        return go.Figure().add_annotation(text="Overall data not loaded", showarrow=False)
 
-        # Get turbine data
-        turbine_data = df[df["StationId"] == selected_turbine]
+    try:
+        turbine_full_history_df = data_loader.get_turbine_data(selected_turbine_id)
+        if turbine_full_history_df.empty:
+            return go.Figure().add_annotation(text=f"No data for turbine {selected_turbine_id}", showarrow=False)
+
+        if not pd.api.types.is_datetime64_any_dtype(turbine_full_history_df['TimeStamp']):
+            turbine_full_history_df['TimeStamp'] = pd.to_datetime(turbine_full_history_df['TimeStamp'])
+
+        start_datetime = pd.to_datetime(filter_start_date_str)
+        end_datetime = pd.to_datetime(filter_end_date_str) + timedelta(days=1)
+
+        turbine_data = turbine_full_history_df[
+            (turbine_full_history_df["TimeStamp"] >= start_datetime) &
+            (turbine_full_history_df["TimeStamp"] < end_datetime)
+        ]
+        if turbine_data.empty:
+            return go.Figure().add_annotation(text=f"No data for {selected_turbine_id} in selected date range", showarrow=False)
 
         # Create chart
         fig = create_alarm_curtailment_chart(turbine_data)
@@ -288,6 +372,7 @@ def update_alarm_curtailment_chart(selected_turbine, filtered_data):
         return fig
 
     except Exception as e:
+        logger.error(f"Error in update_alarm_curtailment_chart: {str(e)}", exc_info=True)
         return go.Figure().add_annotation(
             text=f"Error: {str(e)}",
             xref="paper",
@@ -301,30 +386,48 @@ def update_alarm_curtailment_chart(selected_turbine, filtered_data):
 @callback(
     Output("anomaly-analysis-content", "children"),
     [
-        Input("selected-turbine-store", "data"),
+        Input("selected-turbine-store", "data"), # selected_turbine_id
         Input("adjacent-turbines-selector", "value"),
         Input("metmast-selector", "value"),
     ],
-    [State("filtered-data-store", "data")],
+    [
+        State("date-picker-range", "start_date"), # Use for context if needed, or latest data point
+        State("date-picker-range", "end_date")
+    ]
 )
 def update_anomaly_analysis(
-    selected_turbine, adjacent_turbines, metmast_columns, filtered_data
+    selected_turbine_id, adjacent_turbine_ids, metmast_columns,
+    filter_start_date_str, filter_end_date_str # These define the context window
 ):
     """Update production anomaly analysis."""
-    if not selected_turbine or not filtered_data:
+    if not selected_turbine_id:
         return "No data available"
 
-    try:
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+    if not data_loader.data_loaded or data_loader.data is None:
+        return "Overall data not loaded"
 
-        # Get latest data for analysis
-        latest_time = df["TimeStamp"].max()
-        latest_data = df[df["TimeStamp"] == latest_time]
+    try:
+        # Get all data, then filter to the latest point for the selected turbine
+        # within the dashboard's current date range.
+        df_all_turbines = data_loader.data
+        if not pd.api.types.is_datetime64_any_dtype(df_all_turbines['TimeStamp']):
+            df_all_turbines['TimeStamp'] = pd.to_datetime(df_all_turbines['TimeStamp'])
+
+        start_datetime = pd.to_datetime(filter_start_date_str)
+        end_datetime = pd.to_datetime(filter_end_date_str) + timedelta(days=1)
+
+        # Data within the dashboard's filtered range
+        data_in_range = df_all_turbines[
+            (df_all_turbines["TimeStamp"] >= start_datetime) & (df_all_turbines["TimeStamp"] < end_datetime)
+        ]
+        if data_in_range.empty:
+            return "No data in selected range for anomaly analysis."
+
+        latest_time_in_range = data_in_range["TimeStamp"].max()
+        latest_data = data_in_range[data_in_range["TimeStamp"] == latest_time_in_range]
 
         # Get selected turbine data
-        turbine_row = latest_data[latest_data["StationId"] == selected_turbine]
+        turbine_row = latest_data[latest_data["StationId"] == selected_turbine_id]
         if turbine_row.empty:
             return "No current data for selected turbine"
 
@@ -345,9 +448,9 @@ def update_anomaly_analysis(
             adjacent_avg_wind = 0
             adjacent_avg_power = 0
 
-            if adjacent_turbines:
-                adjacent_data = latest_data[
-                    latest_data["StationId"].isin(adjacent_turbines)
+            if adjacent_turbine_ids:
+                adjacent_data = latest_data[ # latest_data is already filtered by latest_time_in_range
+                    latest_data["StationId"].isin(adjacent_turbine_ids)
                 ]
                 adjacent_total = len(adjacent_data)
                 adjacent_producing = len(
@@ -489,26 +592,45 @@ def update_anomaly_analysis(
         return analysis_results
 
     except Exception as e:
+        logger.error(f"Error in update_anomaly_analysis: {str(e)}", exc_info=True)
         return f"Error in anomaly analysis: {str(e)}"
 
 
 @callback(
     [Output("detailed-data-table", "columns"), Output("detailed-data-table", "data")],
-    [Input("selected-turbine-store", "data")],
-    [State("filtered-data-store", "data")],
+    [Input("selected-turbine-store", "data")], # selected_turbine_id
+    [
+        State("date-picker-range", "start_date"),
+        State("date-picker-range", "end_date")
+    ]
 )
-def update_detailed_data_table(selected_turbine, filtered_data):
+def update_detailed_data_table(selected_turbine_id, filter_start_date_str, filter_end_date_str):
     """Update detailed data table for selected turbine."""
-    if not selected_turbine or not filtered_data:
+    if not selected_turbine_id or not filter_start_date_str or not filter_end_date_str:
+        return [], []
+
+    if not data_loader.data_loaded or data_loader.data is None:
         return [], []
 
     try:
-        # Convert to DataFrame
-        df = pd.DataFrame(filtered_data)
-        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+        turbine_full_history_df = data_loader.get_turbine_data(selected_turbine_id)
+        if turbine_full_history_df.empty:
+            return [], []
+
+        if not pd.api.types.is_datetime64_any_dtype(turbine_full_history_df['TimeStamp']):
+            turbine_full_history_df['TimeStamp'] = pd.to_datetime(turbine_full_history_df['TimeStamp'])
+
+        start_datetime = pd.to_datetime(filter_start_date_str)
+        end_datetime = pd.to_datetime(filter_end_date_str) + timedelta(days=1)
+
+        # Filter data for the selected turbine within the dashboard's date range
+        df = turbine_full_history_df[
+            (turbine_full_history_df["TimeStamp"] >= start_datetime) &
+            (turbine_full_history_df["TimeStamp"] < end_datetime)
+        ]
 
         # Get turbine data
-        turbine_data = df[df["StationId"] == selected_turbine].copy()
+        turbine_data = df.copy() # df is already filtered for the selected turbine and date range
 
         if turbine_data.empty:
             return [], []
@@ -582,4 +704,5 @@ def update_detailed_data_table(selected_turbine, filtered_data):
         return columns, table_data.to_dict("records")
 
     except Exception as e:
+        logger.error(f"Error in update_detailed_data_table: {str(e)}", exc_info=True)
         return [], []

@@ -445,7 +445,7 @@ def create_main_dashboard_layout():
             # Store components for data
             dcc.Store(id="data-store"),
             dcc.Store(id="layout-store"),
-            dcc.Store(id="filtered-data-store"),
+            dcc.Store(id="filter-params-store"),  # Replaced filtered-data-store
             dcc.Store(id="selected-turbine-store"),
         ],
         fluid=True,
