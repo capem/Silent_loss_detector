@@ -143,30 +143,49 @@ app.layout = create_main_dashboard_layout()
 server = app.server
 
 if __name__ == "__main__":
-    # Setup logging only when running the app directly
-    log_files = setup_logging()
+    # Determine if the application is running in debug mode for the server.
+    # This should match the debug flag passed to app.run().
+    APP_DEBUG_MODE = True  # As app.run(debug=True) is used below.
 
-    # Set custom exception handler
-    sys.excepthook = log_exception_handler
+    # Setup logging and application-specific startup messages only in the main worker process
+    # (when Werkzeug reloader is active and this is the child process) or when not in debug mode.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not APP_DEBUG_MODE:
+        log_files = setup_logging() # setup_logging() contains "Application Starting" messages
+        if log_files: # Only proceed if logging was successfully set up
+            sys.excepthook = log_exception_handler
 
-    # Log app initialization
-    logging.info("Dash app initialized successfully")
-    logging.info(f"App title: {app.title}")
-    logging.info(f"Suppress callback exceptions: {app.config.suppress_callback_exceptions}")
+            # Log app initialization details after logging setup
+            logging.info("Dash app initialized successfully")
+            logging.info(f"App title: {app.title}")
+            logging.info(f"Suppress callback exceptions: {app.config.suppress_callback_exceptions}")
+            logging.info("Starting Dash development server...")
+            logging.info("Server will be available at: http://localhost:8050")
+            logging.info("Press Ctrl+C to stop the server")
+    # else:
+        # This branch is executed by the parent reloader process when APP_DEBUG_MODE is True.
+        # No main logging setup is performed here to avoid duplicates.
+        # _logging_initialized remains False for this parent process.
+        pass
 
     try:
-        logging.info("Starting Dash development server...")
-        logging.info("Server will be available at: http://localhost:8050")
-        logging.info("Press Ctrl+C to stop the server")
-
-        app.run(debug=True, port=8050)
-
+        app.run(debug=APP_DEBUG_MODE, port=8050)
     except Exception as e:
-        logging.error(f"Failed to start Dash server: {e}", exc_info=True)
+        # Log the error only if logging was initialized in this process's execution path.
+        if _logging_initialized:
+            logging.error(f"Failed to start Dash server: {e}", exc_info=True)
+        else:
+            # Fallback for errors in the parent reloader process before logging is set up by child.
+            import traceback # Ensure traceback is imported for this block
+            sys.stderr.write(f"Critical error during Dash server startup (parent reloader or pre-logging): {e}\n")
+            traceback.print_exc(file=sys.stderr)
         raise
     finally:
-        logging.info("Dash application shutdown")
-        logging.info("="*60)
+        # Log shutdown only if logging was initialized by this process.
+        # This typically means it will log if not in debug mode.
+        # The parent reloader process (if APP_DEBUG_MODE=True) will have _logging_initialized=False.
+        if _logging_initialized:
+            logging.info("Dash application shutdown sequence initiated.")
+            logging.info("="*60)
 else:
     # For imports (like in tests), setup minimal logging
     if not _logging_initialized:
@@ -176,3 +195,5 @@ else:
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[logging.StreamHandler(sys.stdout)]
         )
+        _logging_initialized = True # Mark that basic logging has been configured
+        logging.info("app.py imported. Basic logging configured for module context.")
