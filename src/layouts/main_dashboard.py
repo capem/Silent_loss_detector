@@ -240,201 +240,31 @@ def create_main_dashboard_layout():
                 ],
                 className="mb-4",
             ),
-            # Operational State Summary
+            # Operational State Breakdown Table
             dbc.Row(
                 [
                     dbc.Col(
-                        [
-                            dbc.Card(
-                                [
-                                    dbc.CardHeader(
-                                        html.H4(
-                                            "Operational State Summary",
-                                            className="mb-0",
-                                        )
-                                    ),
-                                    dbc.CardBody(
-                                        [
-                                            html.Div(
-                                                id="state-summary-cards",
-                                                children="No data to display",
-                                            )
-                                        ]
-                                    ),
-                                ]
-                            )
-                        ],
-                        width=12,
-                    )
-                ],
-                className="mb-4",
-            ),
-            # Turbine List and Filters
-            dbc.Row(
-                [
-                    dbc.Col(
-                        [
-                            dbc.Card(
-                                [
-                                    dbc.CardHeader(
-                                        [
-                                            dbc.Row(
-                                                [
-                                                    dbc.Col(
-                                                        [
-                                                            html.H4(
-                                                                "Turbine Overview",
-                                                                className="mb-0",
-                                                            )
-                                                        ],
-                                                        width=6,
-                                                    ),
-                                                    dbc.Col(
-                                                        [
-                                                            dbc.InputGroup(
-                                                                [
-                                                                    dbc.InputGroupText(
-                                                                        "Filter by State:"
-                                                                    ),
-                                                                    dcc.Dropdown(
-                                                                        id="state-filter",
-                                                                        options=[
-                                                                            {
-                                                                                "label": "All States",
-                                                                                "value": "ALL",
-                                                                            }
-                                                                        ]
-                                                                        + [
-                                                                            {
-                                                                                "label": state_info[
-                                                                                    "name"
-                                                                                ],
-                                                                                "value": state_key,
-                                                                            }
-                                                                            for state_key, state_info in OPERATIONAL_STATES.items()
-                                                                        ],
-                                                                        value="ALL",
-                                                                        clearable=False,
-                                                                        style={
-                                                                            "minWidth": "200px"
-                                                                        },
-                                                                    ),
-                                                                ],
-                                                                size="sm",
-                                                            )
-                                                        ],
-                                                        width=6,
-                                                    ),
-                                                ]
-                                            )
-                                        ]
-                                    ),
-                                    dbc.CardBody(
-                                        [
-                                            html.Div(
-                                                [
-                                                    dash_table.DataTable(
-                                                        id="turbine-table",
-                                                        columns=[
-                                                            {
-                                                                "name": "Station ID",
-                                                                "id": "StationId",
-                                                                "type": "text",
-                                                            },
-                                                            {
-                                                                "name": "Current State",
-                                                                "id": "state_category",
-                                                                "type": "text",
-                                                            },
-                                                            {
-                                                                "name": "Subcategory",
-                                                                "id": "state_subcategory",
-                                                                "type": "text",
-                                                            },
-                                                            {
-                                                                "name": "Power (kW)",
-                                                                "id": "wtc_ActPower_mean",
-                                                                "type": "numeric",
-                                                                "format": {
-                                                                    "specifier": ".1f"
-                                                                },
-                                                            },
-                                                            {
-                                                                "name": "Wind Speed (m/s)",
-                                                                "id": "wtc_AcWindSp_mean",
-                                                                "type": "numeric",
-                                                                "format": {
-                                                                    "specifier": ".1f"
-                                                                },
-                                                            },
-                                                            {
-                                                                "name": "Last Update",
-                                                                "id": "TimeStamp",
-                                                                "type": "datetime",
-                                                            },
-                                                            {
-                                                                "name": "Reason",
-                                                                "id": "state_reason",
-                                                                "type": "text",
-                                                            },
-                                                        ],
-                                                        data=[],
-                                                        sort_action="native",
-                                                        filter_action="native",
-                                                        page_action="native",
-                                                        page_current=0,
-                                                        page_size=TABLE_PAGE_SIZE,
-                                                        row_selectable="single",
-                                                        selected_rows=[],
-                                                        style_cell={
-                                                            "textAlign": "left",
-                                                            "padding": "10px",
-                                                            "fontFamily": "Arial",
-                                                        },
-                                                        style_header={
-                                                            "backgroundColor": "rgb(230, 230, 230)",
-                                                            "fontWeight": "bold",
-                                                        },
-                                                        style_data_conditional=[
-                                                            {
-                                                                "if": {
-                                                                    "filter_query": "{state_category} = Producing"
-                                                                },
-                                                                "backgroundColor": "#d4edda",
-                                                                "color": "black",
-                                                            },
-                                                            {
-                                                                "if": {
-                                                                    "filter_query": '{state_category} contains "Explained"'
-                                                                },
-                                                                "backgroundColor": "#fff3cd",
-                                                                "color": "black",
-                                                            },
-                                                            {
-                                                                "if": {
-                                                                    "filter_query": '{state_category} contains "Verification Pending"'
-                                                                },
-                                                                "backgroundColor": "#ffeaa7",
-                                                                "color": "black",
-                                                            },
-                                                            {
-                                                                "if": {
-                                                                    "filter_query": '{state_category} contains "Unexpected"'
-                                                                },
-                                                                "backgroundColor": "#f8d7da",
-                                                                "color": "black",
-                                                            },
-                                                        ],
-                                                        tooltip_data=[],
-                                                        tooltip_duration=None,
-                                                    )
-                                                ]
-                                            )
-                                        ]
-                                    ),
-                                ]
-                            )
-                        ],
+                        dbc.Card(
+                            [
+                                dbc.CardHeader(html.H4("Operational State Breakdown", className="mb-0")),
+                                dbc.CardBody(
+                                    dash_table.DataTable(
+                                        id="operational-state-breakdown-table",
+                                        # Columns will be set dynamically in the callback
+                                        data=[],
+                                        sort_action="native",
+                                        filter_action="native",
+                                        page_action="native",
+                                        page_current=0,
+                                        page_size=TABLE_PAGE_SIZE,
+                                        row_selectable="single",
+                                        selected_rows=[],
+                                        style_cell={"textAlign": "left", "padding": "10px", "fontFamily": "Arial"},
+                                        style_header={"backgroundColor": "rgb(230, 230, 230)", "fontWeight": "bold"},
+                                    )
+                                ),
+                            ]
+                        ),
                         width=12,
                     )
                 ],
@@ -450,47 +280,6 @@ def create_main_dashboard_layout():
         ],
         fluid=True,
     )
-
-
-def create_state_summary_cards(state_counts: dict) -> list:
-    """Create summary cards for operational states."""
-    cards = []
-
-    for state_key, state_info in OPERATIONAL_STATES.items():
-        count = state_counts.get(state_key, 0)
-        percentage = state_counts.get(f"{state_key}_pct", 0)
-
-        card = dbc.Col(
-            [
-                dbc.Card(
-                    [
-                        dbc.CardBody(
-                            [
-                                html.H4(str(count), className="card-title text-center"),
-                                html.P(
-                                    state_info["name"],
-                                    className="card-text text-center small",
-                                ),
-                                html.P(
-                                    f"{percentage:.1f}%",
-                                    className="text-muted text-center small",
-                                ),
-                            ],
-                            className="py-2",
-                        )
-                    ],
-                    color=state_info["color"],
-                    outline=True,
-                    className="h-100",
-                )
-            ],
-            width=2,
-            className="mb-2",
-        )
-
-        cards.append(card)
-
-    return dbc.Row(cards)
 
 
 def create_data_summary_display(summary: dict) -> list:

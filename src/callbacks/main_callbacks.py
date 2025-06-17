@@ -12,10 +12,7 @@ import pandas as pd
 
 from ..utils.data_loader import DataLoader
 from ..utils.operational_state import OperationalStateClassifier
-from ..layouts.main_dashboard import (
-    create_state_summary_cards,
-    create_data_summary_display,
-)
+from ..layouts.main_dashboard import create_data_summary_display
 from ..utils.config import OPERATIONAL_STATES
 from ..utils.logging_utils import (
     log_callback_execution,
@@ -283,101 +280,60 @@ def update_date_range(btn_24h, btn_7d, btn_30d, btn_all, data_store):
 
 @callback(
     [
-        Output("filter-params-store", "data"), # Changed Output
-        Output("state-summary-cards", "children"),
-        Output("turbine-table", "data"),
+        Output("operational-state-breakdown-table", "data"),
+        Output("operational-state-breakdown-table", "columns"),
     ],
     [
         Input("date-picker-range", "start_date"),
         Input("date-picker-range", "end_date"),
-        Input("state-filter", "value"),
-        Input("data-store", "data"), # This now contains summary and timestamp
+        Input("data-store", "data"),
     ],
 )
-def update_filtered_data(start_date, end_date, state_filter, data_store):
-    """Update filtered data based on date range and state filter.
-    'filter-params-store' will hold current filter parameters.
-    """
-    logger = logging.getLogger("callbacks.update_filtered_data")
+def update_breakdown_table(start_date, end_date, data_store):
+    """Update the operational state breakdown table based on the selected date range."""
+    logger = logging.getLogger("callbacks.update_breakdown_table")
     if not data_loader.data_loaded or data_loader.data is None or data_loader.data.empty or not start_date or not end_date:
-        return {}, "No data to display", []
+        return [], []
 
     try:
-
-        # Access the full DataFrame from the global data_loader instance
         df = data_loader.data
         if not pd.api.types.is_datetime64_any_dtype(df['TimeStamp']):
-             df['TimeStamp'] = pd.to_datetime(df['TimeStamp']) # Should be redundant
+            df['TimeStamp'] = pd.to_datetime(df['TimeStamp'])
 
-        # Filter by date range
         start_datetime = pd.to_datetime(start_date)
-        end_datetime = pd.to_datetime(end_date) + timedelta(days=1)  # Include end date
+        end_datetime = pd.to_datetime(end_date) + timedelta(days=1)
 
-        filtered_df_by_date = df[
+        filtered_df = df[
             (df["TimeStamp"] >= start_datetime) & (df["TimeStamp"] < end_datetime)
         ]
 
-        if filtered_df_by_date.empty:
-            return {"start_date": start_date, "end_date": end_date, "visible_turbine_ids": []}, "No data within selected date range", []
+        if filtered_df.empty:
+            return [], []
 
-        # Get latest state for each turbine
-        latest_states_in_range = filtered_df_by_date.loc[filtered_df_by_date.groupby("StationId")["TimeStamp"].idxmax()]
-
-        # Filter by operational state if specified
-        if state_filter and state_filter != "ALL":
-            latest_states_in_range = latest_states_in_range[
-                latest_states_in_range["operational_state"] == state_filter
-            ]
+        # Group by turbine and operational state to count occurrences
+        breakdown = filtered_df.groupby(['StationId', 'operational_state']).size().reset_index(name='count')
         
-        visible_turbine_ids = latest_states_in_range['StationId'].tolist() if not latest_states_in_range.empty else []
+        # Pivot the table to have states as columns
+        pivot_table = breakdown.pivot(index='StationId', columns='operational_state', values='count').fillna(0).astype(int)
+        
+        # Add a total column
+        pivot_table['Total'] = pivot_table.sum(axis=1)
+        
+        # Reset index to make StationId a column again
+        pivot_table.reset_index(inplace=True)
 
-        if latest_states_in_range.empty and state_filter and state_filter != "ALL":
-             filter_params_payload = {"start_date": start_date, "end_date": end_date, "visible_turbine_ids": []}
-             return filter_params_payload, f"No turbines in '{OPERATIONAL_STATES.get(state_filter, {}).get('name', state_filter)}' state for selected date range", []
-
-        # Calculate state summary
-        state_counts = {}
-        total_turbines_in_selection = len(latest_states_in_range)
-
-        for state_key in OPERATIONAL_STATES.keys():
-            count = len(latest_states_in_range[latest_states_in_range["operational_state"] == state_key])
-            state_counts[state_key] = count
-            state_counts[f"{state_key}_pct"] = (
-                (count / total_turbines_in_selection * 100) if total_turbines_in_selection > 0 else 0
-            )
-
-        # Prepare table data
-        table_data_df = latest_states_in_range[
-            [
-                "StationId",
-                "state_category",
-                "state_subcategory",
-                "wtc_ActPower_mean",
-                "wtc_AcWindSp_mean",
-                "TimeStamp",
-                "state_reason",
-            ]
-        ].copy()
-
-        # Format timestamps for display
-        table_data_df["TimeStamp"] = table_data_df["TimeStamp"].dt.strftime("%Y-%m-%d %H:%M")
-        table_data = table_data_df.to_dict("records")
-
-        filter_params_payload = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "visible_turbine_ids": visible_turbine_ids
-        }
-
-        return (
-            filter_params_payload,
-            create_state_summary_cards(state_counts),
-            table_data,
-        )
+        # Prepare columns for DataTable
+        columns = [{"name": "Station ID", "id": "StationId"}]
+        for state_key, state_info in OPERATIONAL_STATES.items():
+            if state_key in pivot_table.columns:
+                columns.append({"name": state_info['name'], "id": state_key})
+        columns.append({"name": "Total Occurrences", "id": "Total"})
+        
+        return pivot_table.to_dict('records'), columns
 
     except Exception as e:
-        logger.error(f"Error in update_filtered_data: {str(e)}", exc_info=True)
-        return {}, f"Error filtering data: {str(e)}", []
+        logger.error(f"Error in update_breakdown_table: {str(e)}", exc_info=True)
+        return [], []
 
 
 @callback(
@@ -386,8 +342,8 @@ def update_filtered_data(start_date, end_date, state_filter, data_store):
         Output("investigation-panel", "children"),
         Output("investigation-panel", "style"),
     ],
-    [Input("turbine-table", "selected_rows")],
-    [State("turbine-table", "data")], # No longer need filtered-data-store here
+    [Input("operational-state-breakdown-table", "selected_rows")],
+    [State("operational-state-breakdown-table", "data")],
     prevent_initial_call=True,
 )
 @log_callback_execution
