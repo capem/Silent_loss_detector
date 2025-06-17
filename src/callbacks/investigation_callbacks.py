@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__) # Add a logger for this module
     ]
 )
 def update_turbine_status_and_metrics(selected_turbine_id, start_date_str, end_date_str):
-    """Update selected turbine status and key metrics."""
+    """Update selected turbine summary and analysis period metrics."""
     if not selected_turbine_id or not start_date_str or not end_date_str:
         return "No turbine selected", "No data available"
 
@@ -56,73 +56,40 @@ def update_turbine_status_and_metrics(selected_turbine_id, start_date_str, end_d
         if turbine_data_in_range.empty:
             return f"No data for {selected_turbine_id} in selected date range", "No data available"
 
-        latest_data = turbine_data_in_range.sort_values(by="TimeStamp", ascending=False).iloc[0]
+        # Summary Card
+        summary_content = html.Div([
+            html.Div([html.Strong("Turbine ID: "), html.Span(selected_turbine_id)], className="mb-2"),
+            html.Div([html.Strong("Analysis Period: "), html.Span(f"{start_datetime.strftime('%Y-%m-%d')} to {end_datetime.strftime('%Y-%m-%d')}")], className="mb-2"),
+            html.Div([html.Strong("Data Points: "), html.Span(f"{len(turbine_data_in_range):,}")], className="mb-2"),
+        ])
 
-        # Status display
-        state_info = OPERATIONAL_STATES.get(latest_data["operational_state"], {})
-        status_color = state_info.get("color", "#6c757d")
+        # Metrics Card
+        avg_power = turbine_data_in_range["wtc_ActPower_mean"].mean()
+        avg_wind_speed = turbine_data_in_range["wtc_AcWindSp_mean"].mean()
+        
+        # Data Availability
+        expected_points = (end_datetime - start_datetime).total_seconds() / 600  # 10-min intervals
+        availability = (len(turbine_data_in_range) / expected_points) * 100 if expected_points > 0 else 0
+        
+        # Total Curtailment
+        internal_curt = turbine_data_in_range["Duration 2006(s)"].sum() / 3600  # hours
+        external_curt = turbine_data_in_range["wtc_PowerRed_timeon"].sum() / 3600 # hours
+        total_curtailment = internal_curt + external_curt
 
-        status_content = [
-            html.Div(
-                [
-                    html.H6(
-                        latest_data["state_category"],
-                        style={"color": status_color, "margin-bottom": "5px"},
-                    ),
-                    html.P(
-                        latest_data["state_subcategory"],
-                        className="text-muted small mb-2",
-                    ),
-                    html.P(
-                        latest_data["state_reason"],
-                        className="small",
-                        style={"font-style": "italic"},
-                    ),
-                ]
-            )
-        ]
+        # Total Energy Production (MWh)
+        # Assuming 10-minute intervals (1/6 hour)
+        total_energy_mwh = (turbine_data_in_range["wtc_ActPower_mean"] * (10 / 60)).sum() / 1000
 
-        # Metrics display
-        metrics_content = [
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Strong("Power Output: "),
-                            html.Span(f"{latest_data['wtc_ActPower_mean']:.1f} kW"),
-                        ],
-                        className="mb-2",
-                    ),
-                    html.Div(
-                        [
-                            html.Strong("Wind Speed: "),
-                            html.Span(f"{latest_data['wtc_AcWindSp_mean']:.1f} m/s"),
-                        ],
-                        className="mb-2",
-                    ),
-                    html.Div(
-                        [
-                            html.Strong("Last Update: "),
-                            html.Span(
-                                latest_data["TimeStamp"].strftime("%Y-%m-%d %H:%M")
-                            ),
-                        ],
-                        className="mb-2",
-                    ),
-                    html.Div(
-                        [
-                            html.Strong("Active Alarms: "),
-                            html.Span(
-                                "Yes" if latest_data["EffectiveAlarmTime"] > 0 else "No"
-                            ),
-                        ],
-                        className="mb-2",
-                    ),
-                ]
-            )
-        ]
 
-        return status_content, metrics_content
+        metrics_content = html.Div([
+            html.Div([html.Strong("Avg. Power Output: "), html.Span(f"{avg_power:.2f} kW")], className="mb-2"),
+            html.Div([html.Strong("Avg. Wind Speed: "), html.Span(f"{avg_wind_speed:.2f} m/s")], className="mb-2"),
+            html.Div([html.Strong("Data Availability: "), html.Span(f"{availability:.1f}%")], className="mb-2"),
+            html.Div([html.Strong("Total Curtailment: "), html.Span(f"{total_curtailment:.1f} h")], className="mb-2"),
+            html.Div([html.Strong("Total Energy: "), html.Span(f"{total_energy_mwh:.2f} MWh")], className="mb-2"),
+        ])
+
+        return summary_content, metrics_content
 
     except Exception as e:
         logger.error(f"Error in update_turbine_status_and_metrics: {str(e)}", exc_info=True)

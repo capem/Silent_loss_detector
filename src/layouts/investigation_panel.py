@@ -59,7 +59,7 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                         [
                                             dbc.CardHeader(
                                                 html.H5(
-                                                    "Current Status", className="mb-0"
+                                                    "Turbine Summary", className="mb-0"
                                                 )
                                             ),
                                             dbc.CardBody(
@@ -75,7 +75,7 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                     dbc.Card(
                                         [
                                             dbc.CardHeader(
-                                                html.H5("Key Metrics", className="mb-0")
+                                                html.H5("Analysis Period Metrics", className="mb-0")
                                             ),
                                             dbc.CardBody(
                                                 [
