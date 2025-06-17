@@ -5,7 +5,7 @@ This module implements the logic from Spec Version 1.6, Section 3.1.
 
 import pandas as pd
 import numpy as np
-from typing import Dict
+from typing import Dict, List
 from datetime import datetime, timedelta
 
 from .config import (
@@ -39,33 +39,134 @@ class OperationalStateClassifier:
         result_data['state_subcategory'] = 'Unknown'
         result_data['state_reason'] = 'Not classified'
         result_data['is_producing'] = False
+        
+        if data.empty:
+            return data # Return early if data is empty
 
-        # Process each turbine separately to maintain temporal context
-        for station_id in result_data['StationId'].unique():
-            turbine_mask = result_data['StationId'] == station_id
-            turbine_data = result_data[turbine_mask].copy()
+        # Work on a copy to avoid modifying the original DataFrame
+        # Ensure TimeStamp is datetime for grouping and comparisons
+        if not pd.api.types.is_datetime64_any_dtype(data['TimeStamp']):
+            data['TimeStamp'] = pd.to_datetime(data['TimeStamp'])
 
-            # Classify each timestamp for this turbine
-            for idx, row in turbine_data.iterrows():
-                state_info = self._classify_single_timestamp(row, turbine_data, result_data)
+        # Pre-group all data by timestamp for efficient lookup in _get_reference_wind_speeds
+        all_data_grouped_by_timestamp = {ts: group for ts, group in data.groupby('TimeStamp')}
 
-                # Update the result data
-                result_data.loc[idx, 'operational_state'] = state_info['state']
-                result_data.loc[idx, 'state_category'] = state_info['category']
-                result_data.loc[idx, 'state_subcategory'] = state_info['subcategory']
-                result_data.loc[idx, 'state_reason'] = state_info['reason']
-                result_data.loc[idx, 'is_producing'] = state_info['is_producing']
+        # Cache for data_loader calls that are constant per turbine or globally
+        adjacent_turbines_cache = {}
+        global_metmast_columns = self.data_loader.get_metmast_columns()
 
-        return result_data
+        processed_groups = []
+        # Sort data by StationId and TimeStamp to ensure correct temporal order for startup sequences
+        # and consistent processing.
+        data_sorted_for_processing = data.sort_values(['StationId', 'TimeStamp'])
 
-    def _classify_single_timestamp(self, row: pd.Series, turbine_data: pd.DataFrame, all_data: pd.DataFrame) -> Dict[str, any]:
+        for station_id, group_df_original in data_sorted_for_processing.groupby('StationId', sort=False):
+            # Work on a copy of the group to avoid SettingWithCopyWarning on slices
+            group_df = group_df_original.copy()
+            
+            # Initialize result columns for the current group
+            group_df['operational_state'] = 'UNCLASSIFIED' # Default placeholder
+            group_df['state_category'] = OPERATIONAL_STATES['NOT_PRODUCING_UNEXPECTED']['name'] # Default to an unknown/unexpected
+            group_df['state_subcategory'] = OPERATIONAL_STATES['NOT_PRODUCING_UNEXPECTED']['subcategories']['UNKNOWN_NON_PRODUCTION']
+            group_df['state_reason'] = 'Pre-classification pending'
+            group_df['is_producing'] = False
+
+            # --- Vectorized Step 1: Producing ---
+            producing_mask = group_df['wtc_ActPower_min'] > PRODUCTION_THRESHOLD_KW
+            group_df.loc[producing_mask, 'operational_state'] = 'PRODUCING'
+            group_df.loc[producing_mask, 'state_category'] = OPERATIONAL_STATES['PRODUCING']['name']
+            group_df.loc[producing_mask, 'state_subcategory'] = OPERATIONAL_STATES['PRODUCING']['subcategory']
+            # Ensure wtc_ActPower_min is float for formatting; NaNs in wtc_ActPower_min make producing_mask False
+            power_val_str = group_df.loc[producing_mask, 'wtc_ActPower_min'].round(1).astype(str)
+            group_df.loc[producing_mask, 'state_reason'] = "Minimum Power output: " + power_val_str + " kW"
+            group_df.loc[producing_mask, 'is_producing'] = True
+
+            # --- Vectorized Step 2: Alarm (only for non-producing rows) ---
+            # Comparisons with NaN yield False, so alarm_condition_mask handles NaNs in EffectiveAlarmTime
+            alarm_condition_mask = group_df['EffectiveAlarmTime'] > ALARM_THRESHOLD_SECONDS
+            alarm_mask = (~producing_mask) & alarm_condition_mask
+            
+            group_df.loc[alarm_mask, 'operational_state'] = 'NOT_PRODUCING_EXPLAINED'
+            group_df.loc[alarm_mask, 'state_category'] = OPERATIONAL_STATES['NOT_PRODUCING_EXPLAINED']['name']
+            group_df.loc[alarm_mask, 'state_subcategory'] = OPERATIONAL_STATES['NOT_PRODUCING_EXPLAINED']['subcategories']['ALARM_ACTIVE']
+            alarm_time_str = group_df.loc[alarm_mask, 'EffectiveAlarmTime'].round(0).astype(str)
+            # 'UK Text' is a required column, fillna for safety in string concat
+            uk_text_str = group_df.loc[alarm_mask, 'UK Text'].fillna('N/A').astype(str)
+            group_df.loc[alarm_mask, 'state_reason'] = "Active alarm: " + alarm_time_str + "s - " + uk_text_str
+            group_df.loc[alarm_mask, 'is_producing'] = False
+
+            # --- Vectorized Step 3: Curtailment (only for non-producing and non-alarm rows) ---
+            curtailment_external_cond_mask = group_df['wtc_PowerRed_timeon'] > CURTAILMENT_THRESHOLD_SECONDS
+            curtailment_internal_cond_mask = group_df['Duration 2006(s)'] > CURTAILMENT_THRESHOLD_SECONDS
+            any_curtailment_cond_mask = curtailment_external_cond_mask | curtailment_internal_cond_mask
+            curtailment_mask = (~producing_mask) & (~alarm_mask) & any_curtailment_cond_mask
+
+            # Determine reason string vectorially for curtailment
+            curtailment_reason_series = pd.Series("", index=group_df.index, dtype=str)
+            # External reason takes precedence if both are true for a row
+            curtailment_reason_series.loc[curtailment_internal_cond_mask] = "Internal (OEM) curtailment active"
+            curtailment_reason_series.loc[curtailment_external_cond_mask] = "External curtailment active"
+            
+            group_df.loc[curtailment_mask, 'operational_state'] = 'NOT_PRODUCING_EXPLAINED'
+            group_df.loc[curtailment_mask, 'state_category'] = OPERATIONAL_STATES['NOT_PRODUCING_EXPLAINED']['name']
+            group_df.loc[curtailment_mask, 'state_subcategory'] = OPERATIONAL_STATES['NOT_PRODUCING_EXPLAINED']['subcategories']['CURTAILMENT_ACTIVE']
+            group_df.loc[curtailment_mask, 'state_reason'] = curtailment_reason_series[curtailment_mask]
+            group_df.loc[curtailment_mask, 'is_producing'] = False
+            
+            # --- Rows still needing classification (iterative part) ---
+            # These are rows where 'operational_state' is still 'UNCLASSIFIED'
+            unclassified_indices = group_df[group_df['operational_state'] == 'UNCLASSIFIED'].index
+
+            if not unclassified_indices.empty:
+                # Fetch adjacent turbines and metmast info if not already cached for this turbine
+                if station_id not in adjacent_turbines_cache:
+                    adjacent_turbines_cache[station_id] = self.data_loader.get_adjacent_turbines(station_id)
+                current_adjacent_turbines = adjacent_turbines_cache[station_id]
+                # global_metmast_columns is already fetched once
+
+                for idx in unclassified_indices:
+                    row_series = group_df.loc[idx]
+                    
+                    # _classify_single_timestamp will re-check producing, alarm, curtailment.
+                    # This is slightly inefficient but simpler than refactoring _classify_single_timestamp
+                    # to start at a specific step. The main gain is from fewer iterations.
+                    state_info = self._classify_single_timestamp(
+                        row_series,
+                        group_df, # Pass the full group_df (which includes its own history sorted by time)
+                        all_data_grouped_by_timestamp,
+                        current_adjacent_turbines,
+                        global_metmast_columns
+                    )
+                    group_df.loc[idx, 'operational_state'] = state_info['state']
+                    group_df.loc[idx, 'state_category'] = state_info['category']
+                    group_df.loc[idx, 'state_subcategory'] = state_info['subcategory']
+                    group_df.loc[idx, 'state_reason'] = state_info['reason']
+                    group_df.loc[idx, 'is_producing'] = state_info['is_producing']
+            
+            processed_groups.append(group_df) # Append the fully classified group
+
+        if not processed_groups:
+            # If data was not empty but no groups were processed (e.g., no StationId),
+            # return the initial data copy with default classification columns.
+            return result_data
+            
+        final_classified_data = pd.concat(processed_groups)
+        return final_classified_data.reindex(result_data.index) # Restore original index order using result_data's index
+
+    def _classify_single_timestamp(self, row: pd.Series, 
+                                 turbine_specific_history: pd.DataFrame, 
+                                 all_data_grouped_by_timestamp: Dict,
+                                 adjacent_turbine_ids_for_row_station: List[str],
+                                 global_metmast_columns: List[str]) -> Dict[str, any]:
         """
         Classify operational state for a single timestamp.
 
         Args:
             row: Current timestamp data
-            turbine_data: Historical data for this turbine
-            all_data: All turbine data for reference comparisons
+            turbine_specific_history: Historical data for this turbine (sorted by time)
+            all_data_grouped_by_timestamp: All turbine data, pre-grouped by timestamp
+            adjacent_turbine_ids_for_row_station: List of adjacent turbine IDs for the current row's station
+            global_metmast_columns: List of all metmast column names
 
         Returns:
             Dictionary with state classification information
@@ -109,7 +210,12 @@ class OperationalStateClassifier:
             }
 
         # Step 4: Assess wind conditions and sensor integrity
-        wind_sensor_assessment = self._assess_wind_and_sensor(row, all_data, timestamp)
+        wind_sensor_assessment = self._assess_wind_and_sensor(row, 
+                                                              all_data_grouped_by_timestamp, 
+                                                              timestamp,
+                                                              adjacent_turbine_ids_for_row_station,
+                                                              global_metmast_columns
+                                                              )
 
         # Step 5: Check for sensor errors first
         if wind_sensor_assessment['is_sensor_error']:
@@ -135,7 +241,10 @@ class OperationalStateClassifier:
             }
 
         # Step 7: Check for startup sequences
-        startup_assessment = self._assess_startup_sequence(row, turbine_data, all_data)
+        startup_assessment = self._assess_startup_sequence(row, 
+                                                           turbine_specific_history, 
+                                                           all_data_grouped_by_timestamp # Passed for future use, not currently used by method
+                                                           )
         if startup_assessment['is_startup']:
             if startup_assessment['trigger'] == 'POST_LOW_WIND':
                 return {
@@ -193,15 +302,20 @@ class OperationalStateClassifier:
             'is_producing': False
         }
 
-    def _assess_wind_and_sensor(self, row: pd.Series, all_data: pd.DataFrame,
-                                timestamp: datetime) -> Dict[str, any]:
+    def _assess_wind_and_sensor(self, row: pd.Series, 
+                                all_data_grouped_by_timestamp: Dict,
+                                timestamp: datetime,
+                                adjacent_turbine_ids_for_row_station: List[str],
+                                global_metmast_columns: List[str]) -> Dict[str, any]:
         """
         Assess wind conditions and sensor integrity using turbine sensor and reference data.
 
         Args:
             row: Current timestamp data
-            all_data: All turbine data for reference
+            all_data_grouped_by_timestamp: All data pre-grouped by timestamp
             timestamp: Current timestamp
+            adjacent_turbine_ids_for_row_station: Adjacent turbine IDs for the current row's station
+            global_metmast_columns: List of metmast column names
 
         Returns:
             Dictionary with wind and sensor assessment results:
@@ -219,7 +333,11 @@ class OperationalStateClassifier:
         """
         turbine_wind = row['wtc_AcWindSp_mean']
         station_id = row['StationId']
-        ref_info = self._get_reference_wind_speeds(station_id, all_data, timestamp)
+        ref_info = self._get_reference_wind_speeds(all_data_grouped_by_timestamp, 
+                                                   timestamp,
+                                                   adjacent_turbine_ids_for_row_station,
+                                                   global_metmast_columns
+                                                   )
         avg_ref_wind = ref_info['avg_reference']
         ref_count = ref_info['count']
 
@@ -279,55 +397,56 @@ class OperationalStateClassifier:
 
         return result
 
-    def _get_reference_wind_speeds(self, station_id: str, all_data: pd.DataFrame,
-                                 timestamp: datetime) -> Dict[str, float]:
+    def _get_reference_wind_speeds(self, 
+                                 all_data_grouped_by_timestamp: Dict,
+                                 timestamp: datetime,
+                                 adjacent_turbine_ids_list: List[str],
+                                 metmast_column_names_list: List[str]) -> Dict[str, float]:
         """Get reference wind speeds from adjacent turbines and metmasts."""
-        # Get data for the same timestamp
-        timestamp_data = all_data[all_data['TimeStamp'] == timestamp]
+        
+        timestamp_specific_data = all_data_grouped_by_timestamp.get(timestamp)
+        if timestamp_specific_data is None or timestamp_specific_data.empty:
+            return {'avg_reference': 0.0, 'count': 0, 'values': []}
 
         reference_speeds = []
 
-        # Get adjacent turbines
-        adjacent_turbines = self.data_loader.get_adjacent_turbines(station_id)
+        if timestamp_specific_data is not None:
+            # Adjacent turbines wind speeds
+            if 'StationId' in timestamp_specific_data.columns and 'wtc_AcWindSp_mean' in timestamp_specific_data.columns:
+                adj_turbines_data_at_ts = timestamp_specific_data[
+                    timestamp_specific_data['StationId'].isin(adjacent_turbine_ids_list)
+                ]
+                if not adj_turbines_data_at_ts.empty:
+                    valid_speeds = adj_turbines_data_at_ts['wtc_AcWindSp_mean'].dropna()
+                    if not valid_speeds.empty:
+                        reference_speeds.extend(valid_speeds.values)  # Use .values for NumPy array
 
-        for adj_turbine in adjacent_turbines:
-            adj_data = timestamp_data[timestamp_data['StationId'] == adj_turbine]
-            if not adj_data.empty:
-                adj_row = adj_data.iloc[0]
-                reference_speeds.append(adj_row['wtc_AcWindSp_mean'])
-
-        # Get metmast data
-        metmast_cols = self.data_loader.get_metmast_columns()
-        for col in metmast_cols:
-            if col in timestamp_data.columns:
-                metmast_values = timestamp_data[col].dropna()
-                if not metmast_values.empty:
-                    reference_speeds.extend(metmast_values.tolist())
+            # Get metmast data
+            for met_col in metmast_column_names_list:
+                if met_col in timestamp_specific_data.columns:
+                    met_series_at_ts = timestamp_specific_data[met_col].dropna()
+                    if not met_series_at_ts.empty:
+                        # Take the first valid value directly as a scalar
+                        reference_speeds.append(met_series_at_ts.iloc[0])
 
         if reference_speeds:
-            return {
-                'avg_reference': np.mean(reference_speeds),
-                'count': len(reference_speeds),
-                'values': reference_speeds
-            }
-        else:
-            return {
-                'avg_reference': 0.0,
-                'count': 0,
-                'values': []
-            }
+            avg_ref = np.mean(reference_speeds) if reference_speeds else 0.0
+            return {'avg_reference': avg_ref, 'count': len(reference_speeds), 'values': reference_speeds}
+        
+        return {'avg_reference': 0.0, 'count': 0, 'values': []}
 
-    def _assess_startup_sequence(self, row: pd.Series, turbine_data: pd.DataFrame,
-                               all_data: pd.DataFrame) -> Dict[str, any]:
+    def _assess_startup_sequence(self, row: pd.Series, 
+                               turbine_specific_history: pd.DataFrame,
+                               all_data_grouped_by_timestamp: Dict) -> Dict[str, any]: # all_data_grouped_by_timestamp not used by current logic but passed for consistency/future
         """Assess if turbine is in startup sequence."""
         current_time = row['TimeStamp']
 
         # Look at previous timestamps (last 30 minutes)
-        lookback_time = current_time - timedelta(minutes=30)
-        recent_data = turbine_data[
-            (turbine_data['TimeStamp'] >= lookback_time) &
-            (turbine_data['TimeStamp'] < current_time)
-        ].sort_values('TimeStamp')
+        lookback_time = current_time - timedelta(minutes=30) # turbine_specific_history is already sorted by TimeStamp
+        recent_data = turbine_specific_history[
+            (turbine_specific_history['TimeStamp'] >= lookback_time) &
+            (turbine_specific_history['TimeStamp'] < current_time)
+        ]
 
         if recent_data.empty:
             return {'is_startup': False, 'trigger': None, 'reason': 'No recent data'}
@@ -357,4 +476,3 @@ class OperationalStateClassifier:
                 }
 
         return {'is_startup': False, 'trigger': None, 'reason': 'Not in startup sequence'}
-
