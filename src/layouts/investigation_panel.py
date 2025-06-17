@@ -296,29 +296,7 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                         ]
                                     )
                                 ],
-                                width=6,
-                            ),
-                            dbc.Col(
-                                [
-                                    dbc.Card(
-                                        [
-                                            dbc.CardHeader(
-                                                html.H5(
-                                                    "Production Anomaly Analysis",
-                                                    className="mb-0",
-                                                )
-                                            ),
-                                            dbc.CardBody(
-                                                [
-                                                    html.Div(
-                                                        id="anomaly-analysis-content"
-                                                    )
-                                                ]
-                                            ),
-                                        ]
-                                    )
-                                ],
-                                width=6,
+                                width=12,
                             ),
                         ],
                         className="mb-4",
