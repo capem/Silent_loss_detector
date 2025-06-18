@@ -138,47 +138,9 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                         [
                                             dbc.CardHeader(
                                                 [
-                                                    dbc.Row(
-                                                        [
-                                                            dbc.Col(
-                                                                [
-                                                                    html.H5(
-                                                                        "Power Output Analysis",
-                                                                        className="mb-0",
-                                                                    )
-                                                                ],
-                                                                width=8,
-                                                            ),
-                                                            dbc.Col(
-                                                                [
-                                                                    dbc.ButtonGroup(
-                                                                        [
-                                                                            dbc.Button(
-                                                                                "24h",
-                                                                                id="power-24h",
-                                                                                size="sm",
-                                                                                outline=True,
-                                                                            ),
-                                                                            dbc.Button(
-                                                                                "7d",
-                                                                                id="power-7d",
-                                                                                size="sm",
-                                                                                outline=True,
-                                                                            ),
-                                                                            dbc.Button(
-                                                                                "30d",
-                                                                                id="power-30d",
-                                                                                size="sm",
-                                                                                outline=True,
-                                                                            ),
-                                                                        ],
-                                                                        size="sm",
-                                                                    )
-                                                                ],
-                                                                width=4,
-                                                                className="text-end",
-                                                            ),
-                                                        ]
+                                                    html.H5(
+                                                        "Power Output Analysis",
+                                                        className="mb-0",
                                                     )
                                                 ]
                                             ),
@@ -208,47 +170,9 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                         [
                                             dbc.CardHeader(
                                                 [
-                                                    dbc.Row(
-                                                        [
-                                                            dbc.Col(
-                                                                [
-                                                                    html.H5(
-                                                                        "Wind Speed Comparison",
-                                                                        className="mb-0",
-                                                                    )
-                                                                ],
-                                                                width=8,
-                                                            ),
-                                                            dbc.Col(
-                                                                [
-                                                                    dbc.ButtonGroup(
-                                                                        [
-                                                                            dbc.Button(
-                                                                                "24h",
-                                                                                id="wind-24h",
-                                                                                size="sm",
-                                                                                outline=True,
-                                                                            ),
-                                                                            dbc.Button(
-                                                                                "7d",
-                                                                                id="wind-7d",
-                                                                                size="sm",
-                                                                                outline=True,
-                                                                            ),
-                                                                            dbc.Button(
-                                                                                "30d",
-                                                                                id="wind-30d",
-                                                                                size="sm",
-                                                                                outline=True,
-                                                                            ),
-                                                                        ],
-                                                                        size="sm",
-                                                                    )
-                                                                ],
-                                                                width=4,
-                                                                className="text-end",
-                                                            ),
-                                                        ]
+                                                    html.H5(
+                                                        "Wind Speed Comparison",
+                                                        className="mb-0",
                                                     )
                                                 ]
                                             ),
@@ -365,7 +289,7 @@ def create_investigation_panel_layout(selected_turbine: str = None):
     )
 
 
-def create_power_analysis_chart(turbine_data, adjacent_data=None, time_range_hours=24):
+def create_power_analysis_chart(turbine_data, adjacent_data=None):
     """Create power output analysis chart."""
     fig = make_subplots(
         rows=2,
