@@ -297,6 +297,7 @@ def create_power_analysis_chart(turbine_data, adjacent_data=None):
         subplot_titles=("Power Output", "Operational State"),
         vertical_spacing=0.15,  # Increased spacing to prevent overlap
         row_heights=[0.7, 0.3],
+        shared_xaxes=True,  # Link x-axis zoom between subplots
     )
 
     # Power output line
