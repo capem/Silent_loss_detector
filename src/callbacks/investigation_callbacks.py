@@ -14,7 +14,6 @@ from ..layouts.investigation_panel import (
     create_wind_comparison_chart,
     create_alarm_curtailment_chart,
 )
-from ..utils.config import OPERATIONAL_STATES
 
 logger = logging.getLogger(__name__) # Add a logger for this module
 
@@ -182,20 +181,6 @@ def update_power_analysis_chart(
             y=0.5,
             showarrow=False,
         )
-
-# IMPORTANT: You'll need to apply a similar refactoring pattern (as shown in update_power_analysis_chart)
-# to the following investigation panel callbacks:
-# - update_wind_comparison_chart
-# - update_alarm_curtailment_chart
-# - update_detailed_data_table
-#
-# They all need to:
-# 1. Remove `State("filtered-data-store", "data")`.
-# 2. Potentially use `State("date-picker-range", "start_date")` and `State("date-picker-range", "end_date")`
-#    if they need to respect the main dashboard's date filter, or calculate their own time windows
-#    based on button clicks (24h, 7d, 30d) relative to the turbine's latest data.
-# 3. Fetch data directly from `data_loader.data` using `selected_turbine_id` and then filter/process it.
-# 4. Handle cases where `data_loader.data` might not be loaded.
 
 
 @callback(
