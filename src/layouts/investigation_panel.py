@@ -139,7 +139,7 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                             dbc.CardHeader(
                                                 [
                                                     html.H5(
-                                                        "Power Output Analysis",
+                                                        "Power Output and Operational State Analysis",
                                                         className="mb-0",
                                                     )
                                                 ]
@@ -295,7 +295,7 @@ def create_power_analysis_chart(turbine_data, adjacent_data=None):
         rows=2,
         cols=1,
         subplot_titles=("Power Output", "Operational State"),
-        vertical_spacing=0.1,
+        vertical_spacing=0.15,  # Increased spacing to prevent overlap
         row_heights=[0.7, 0.3],
     )
 
@@ -360,9 +360,9 @@ def create_power_analysis_chart(turbine_data, adjacent_data=None):
     fig.update_yaxes(title_text="State", row=2, col=1, showticklabels=False)
 
     fig.update_layout(
-        title="Power Output and Operational State Analysis",
         height=CHART_HEIGHT,
         hovermode="x unified",
+        margin=dict(t=60, b=50, l=60, r=20)  # Added margins for better spacing
     )
 
     return fig
@@ -415,11 +415,11 @@ def create_wind_comparison_chart(turbine_data, adjacent_data=None, metmast_data=
                 )
 
     fig.update_layout(
-        title="Wind Speed Comparison",
         xaxis_title="Time",
         yaxis_title="Wind Speed (m/s)",
         height=CHART_HEIGHT,
         hovermode="x unified",
+        margin=dict(t=60, b=50, l=60, r=20)  # Added margins for better spacing
     )
 
     return fig
@@ -435,7 +435,7 @@ def create_alarm_curtailment_chart(turbine_data):
             "External Curtailment",
             "Internal Curtailment",
         ),
-        vertical_spacing=0.1,
+        vertical_spacing=0.12,  # Optimized spacing to prevent overlap while fitting in card
     )
 
     # Alarm duration
@@ -480,7 +480,9 @@ def create_alarm_curtailment_chart(turbine_data):
     fig.update_yaxes(title_text="Seconds", row=3, col=1)
 
     fig.update_layout(
-        title="Alarm and Curtailment History", height=CHART_HEIGHT, showlegend=False
+        height=CHART_HEIGHT,  # Keep original height to fit in card
+        showlegend=False,
+        margin=dict(t=60, b=50, l=60, r=20)  # Optimized margins to fit within card
     )
 
     return fig
