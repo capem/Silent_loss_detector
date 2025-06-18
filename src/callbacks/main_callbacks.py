@@ -228,6 +228,7 @@ def handle_layout_upload(contents, filename):
 )
 def update_date_range(btn_24h, btn_7d, btn_30d, btn_all, data_store):
     """Update date range based on button clicks or data loading.
+       Defaults to full data range (min to max) when data is first loaded.
        Ensures NaT values from summary are handled gracefully.
     """
     if not data_store or "summary" not in data_store:
@@ -265,12 +266,16 @@ def update_date_range(btn_24h, btn_7d, btn_30d, btn_all, data_store):
             return None, None
         start_date_dt = min_ts_from_data
     elif is_data_load_trigger and (not triggered_id or not triggered_id.startswith("btn-")):
-        # Default to last 24 hours when data is first loaded and no specific button was the primary trigger
-        start_date_dt = end_date_dt - timedelta(hours=24)
+        # Default to full data range when data is first loaded and no specific button was the primary trigger
+        if pd.isna(min_ts_from_data):
+            return None, None
+        start_date_dt = min_ts_from_data
     else:
         # Fallback or if a button was clicked (already handled above)
-        # If triggered_id is a button, it's fine. If not, default.
-        start_date_dt = end_date_dt - timedelta(hours=24)
+        # If triggered_id is a button, it's fine. If not, default to full range.
+        if pd.isna(min_ts_from_data):
+            return None, None
+        start_date_dt = min_ts_from_data
 
     if pd.isna(start_date_dt):
         return None, None
