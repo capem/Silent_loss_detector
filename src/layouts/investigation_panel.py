@@ -411,6 +411,7 @@ def create_wind_comparison_chart(turbine_data, adjacent_data=None, metmast_data=
                         mode="lines",
                         name=f"Metmast {metmast_id}",
                         line=dict(dash="dash", width=2),
+                        connectgaps=False,  # Don't connect gaps in data to prevent loops
                     )
                 )
 

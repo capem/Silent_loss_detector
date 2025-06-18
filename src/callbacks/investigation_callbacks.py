@@ -233,9 +233,12 @@ def update_wind_comparison_chart(
                 (df_all_turbines["TimeStamp"] >= start_datetime) &
                 (df_all_turbines["TimeStamp"] < end_datetime)
             ]
+            # Sort by timestamp and remove duplicates to prevent loops
+            chart_time_filtered_df = chart_time_filtered_df.sort_values("TimeStamp").drop_duplicates(subset=["TimeStamp"])
             metmast_data_for_chart = chart_time_filtered_df.set_index("TimeStamp")[
                 metmast_columns
-            ].dropna()
+            ]
+            # Don't use dropna() here as it removes entire rows - let individual columns handle NaN values
             metmast_data = metmast_data_for_chart
 
         # Create chart
