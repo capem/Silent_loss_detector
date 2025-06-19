@@ -5,8 +5,6 @@ This module implements the logic from Spec Version 1.6, Section 3.1.
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List
-from datetime import datetime, timedelta
 
 from .config import (
     PRODUCTION_THRESHOLD_KW,
@@ -24,6 +22,392 @@ class OperationalStateClassifier:
     def __init__(self, data_loader):
         self.data_loader = data_loader
 
+    def _pre_calculate_reference_winds(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Pre-calculates reference wind speeds from metmasts and adjacent turbines."""
+        if data.empty:
+            for col in [
+                "adj_turbine_ref_wind_avg",
+                "metmast_ref_wind_avg",
+                "combined_ref_wind_avg",
+            ]:
+                data[col] = np.nan
+            for col in [
+                "adj_turbine_ref_count",
+                "metmast_ref_count",
+                "combined_ref_count",
+            ]:
+                data[col] = 0
+            return data
+
+        # 1. Metmast Reference Wind
+        metmast_cols = self.data_loader.get_metmast_columns()
+        if metmast_cols:
+            metmast_data_long = data[["TimeStamp"] + metmast_cols].melt(
+                id_vars=["TimeStamp"],
+                value_vars=metmast_cols,
+                var_name="met_col",
+                value_name="met_wind",
+            )
+            metmast_data_long.dropna(subset=["met_wind"], inplace=True)
+            metmast_ref_ts = (
+                metmast_data_long.groupby("TimeStamp")["met_wind"]
+                .agg(metmast_ref_wind_avg="mean", metmast_ref_count="count")
+                .reset_index()
+            )
+            data = pd.merge(data, metmast_ref_ts, on="TimeStamp", how="left")
+            data["metmast_ref_wind_avg"] = data["metmast_ref_wind_avg"].fillna(
+                np.nan
+            )  # Redundant if already np.nan from merge
+            data["metmast_ref_count"] = data["metmast_ref_count"].fillna(0).astype(int)
+        else:
+            data["metmast_ref_wind_avg"] = np.nan
+            data["metmast_ref_count"] = 0
+
+        # 2. Adjacent Turbine Reference Wind
+        all_station_ids = data["StationId"].unique()
+        adj_map = {
+            sid: self.data_loader.get_adjacent_turbines(sid) for sid in all_station_ids
+        }
+        adj_list_expanded = []
+        for station_id, adj_turbines in adj_map.items():
+            for adj_turbine in adj_turbines:
+                adj_list_expanded.append(
+                    {"StationId": station_id, "AdjacentStationId": adj_turbine}
+                )
+
+        if not adj_list_expanded:
+            data["adj_turbine_ref_wind_avg"] = np.nan
+            data["adj_turbine_ref_count"] = 0
+        else:
+            adj_df = pd.DataFrame(adj_list_expanded)
+            data_for_adj_lookup = data[
+                ["TimeStamp", "StationId", "wtc_AcWindSp_mean"]
+            ].rename(
+                columns={
+                    "StationId": "AdjacentStationId",
+                    "wtc_AcWindSp_mean": "adj_wind_speed",
+                }
+            )
+            merged_adj_data = pd.merge(
+                data[["TimeStamp", "StationId"]].drop_duplicates(),
+                adj_df,
+                on="StationId",
+                how="left",
+            )
+            merged_adj_data = pd.merge(
+                merged_adj_data,
+                data_for_adj_lookup,
+                on=["TimeStamp", "AdjacentStationId"],
+                how="left",
+            )
+            merged_adj_data.dropna(subset=["adj_wind_speed"], inplace=True)
+            adj_turbine_ref_ts = (
+                merged_adj_data.groupby(["TimeStamp", "StationId"])["adj_wind_speed"]
+                .agg(adj_turbine_ref_wind_avg="mean", adj_turbine_ref_count="count")
+                .reset_index()
+            )
+            data = pd.merge(
+                data, adj_turbine_ref_ts, on=["TimeStamp", "StationId"], how="left"
+            )
+            data["adj_turbine_ref_wind_avg"] = data["adj_turbine_ref_wind_avg"].fillna(
+                np.nan
+            )  # Redundant
+            data["adj_turbine_ref_count"] = (
+                data["adj_turbine_ref_count"].fillna(0).astype(int)
+            )
+
+        # 3. Combine References
+        total_ref_wind_sum = (
+            data["adj_turbine_ref_wind_avg"].fillna(0) * data["adj_turbine_ref_count"]
+            + data["metmast_ref_wind_avg"].fillna(0) * data["metmast_ref_count"]
+        )
+        total_ref_count = data["adj_turbine_ref_count"] + data["metmast_ref_count"]
+        data["combined_ref_wind_avg"] = np.where(
+            total_ref_count > 0, total_ref_wind_sum / total_ref_count, np.nan
+        )
+        data["combined_ref_count"] = total_ref_count
+        return data
+
+    def _pre_calculate_startup_conditions(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Pre-calculates flags for startup sequences."""
+        if (
+            data.empty
+            or "TimeStamp" not in data.columns
+            or not pd.api.types.is_datetime64_any_dtype(data["TimeStamp"])
+        ):
+            data["is_startup_post_low_wind"] = False
+            data["is_startup_post_alarm"] = False
+            data["startup_reason_details"] = ""
+            return data
+
+        data = data.sort_values(["StationId", "TimeStamp"])
+
+        # Post Low Wind Startup
+        data["is_low_wind_event_point"] = data["wtc_AcWindSp_mean"] < CUT_IN_WIND_SPEED
+        data["low_wind_event_time"] = data.loc[
+            data["is_low_wind_event_point"], "TimeStamp"
+        ]
+        data["last_recorded_low_wind_time"] = data.groupby("StationId")[
+            "low_wind_event_time"
+        ].ffill()
+        mask_last_lw_is_past = data["last_recorded_low_wind_time"] < data["TimeStamp"]
+        time_since_lw_recovery = (
+            data["TimeStamp"] - data["last_recorded_low_wind_time"]
+        ).dt.total_seconds() / 60
+        data["is_startup_post_low_wind"] = (
+            mask_last_lw_is_past
+            & (time_since_lw_recovery > 0)
+            & (time_since_lw_recovery <= 20)
+        )
+
+        data["startup_reason_details"] = ""  # Initialize
+        reason_lw_startup_series = (
+            "Startup: "
+            + time_since_lw_recovery.round(0).astype(str)
+            + " min after low wind"
+        )
+        data.loc[data["is_startup_post_low_wind"], "startup_reason_details"] = (
+            reason_lw_startup_series[data["is_startup_post_low_wind"]]
+        )
+
+        # Post Alarm Startup
+        data["is_alarm_active_event_point"] = (
+            data["EffectiveAlarmTime"] > ALARM_THRESHOLD_SECONDS
+        )
+        data["alarm_event_time"] = data.loc[
+            data["is_alarm_active_event_point"], "TimeStamp"
+        ]
+        data["last_recorded_alarm_time"] = data.groupby("StationId")[
+            "alarm_event_time"
+        ].ffill()
+        mask_last_alarm_is_past = data["last_recorded_alarm_time"] < data["TimeStamp"]
+        time_since_alarm_clearance = (
+            data["TimeStamp"] - data["last_recorded_alarm_time"]
+        ).dt.total_seconds() / 60
+        data["is_startup_post_alarm"] = (
+            mask_last_alarm_is_past
+            & (time_since_alarm_clearance > 0)
+            & (time_since_alarm_clearance <= 15)
+        )
+
+        reason_alarm_startup_series = (
+            "Startup: "
+            + time_since_alarm_clearance.round(0).astype(str)
+            + " min after alarm"
+        )
+        # Only set if not already set by low wind startup, and current is post_alarm_startup
+        alarm_startup_reason_mask = data["is_startup_post_alarm"] & (
+            data["startup_reason_details"] == ""
+        )
+        data.loc[alarm_startup_reason_mask, "startup_reason_details"] = (
+            reason_alarm_startup_series[alarm_startup_reason_mask]
+        )
+
+        return data
+
+    def _pre_calculate_wind_sensor_assessment(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Pre-calculates sensor error flags and wind condition categories."""
+        if data.empty:
+            for col in [
+                "is_sensor_error",
+                "sensor_error_type",
+                "wind_condition",
+                "assessment_reason",
+            ]:
+                data[col] = (
+                    False if isinstance(False, type(data.get(col, False))) else pd.NA
+                )
+            return data
+
+        turbine_wind = data["wtc_AcWindSp_mean"]
+        avg_ref_wind = data["combined_ref_wind_avg"]
+        ref_count = data["combined_ref_count"]
+
+        data["is_sensor_error"] = False
+        data["sensor_error_type"] = pd.NA
+        data["wind_condition"] = pd.NA
+        data["assessment_reason"] = ""  # Consolidated reason string
+
+        # Cache formatted strings to avoid re-computation
+        fmt_turbine_wind = turbine_wind.round(1).astype(str)
+        fmt_avg_ref_wind = avg_ref_wind.round(1).astype(str)
+
+        # Case 1: Turbine wind is NaN
+        nan_mask = turbine_wind.isna()
+        data.loc[nan_mask, "is_sensor_error"] = True
+        data.loc[nan_mask, "sensor_error_type"] = "SENSOR_ERROR_ANOMALOUS"
+        base_nan_reason = "Sensor error: Turbine wind speed data missing/invalid (NaN)."
+
+        ref_exists_nan_mask = nan_mask & (ref_count > 0)
+        ref_low_nan_mask = ref_exists_nan_mask & (avg_ref_wind < CUT_IN_WIND_SPEED)
+        data.loc[ref_low_nan_mask, "wind_condition"] = "CONFIRMED_LOW_WIND"
+        data.loc[ref_low_nan_mask, "assessment_reason"] = (
+            base_nan_reason
+            + " Refs ("
+            + fmt_avg_ref_wind[ref_low_nan_mask]
+            + " m/s) indicate low wind."
+        )
+        ref_suff_nan_mask = ref_exists_nan_mask & ~(avg_ref_wind < CUT_IN_WIND_SPEED)
+        data.loc[ref_suff_nan_mask, "wind_condition"] = "SUFFICIENT_CONFIRMED"
+        data.loc[ref_suff_nan_mask, "assessment_reason"] = (
+            base_nan_reason
+            + " Refs ("
+            + fmt_avg_ref_wind[ref_suff_nan_mask]
+            + " m/s) indicate sufficient wind."
+        )
+
+        no_ref_nan_mask = nan_mask & (ref_count == 0)
+        data.loc[no_ref_nan_mask, "wind_condition"] = "SUFFICIENT_SUSPECTED"
+        data.loc[no_ref_nan_mask, "assessment_reason"] = (
+            base_nan_reason + " No references available to determine wind conditions."
+        )
+
+        # Case 2: Turbine wind is NOT NaN (and not already processed by nan_mask)
+        valid_mask = ~nan_mask
+        valid_ref_mask = valid_mask & (ref_count > 0)
+
+        deviation = abs(turbine_wind - avg_ref_wind)
+        err_dev_mask = valid_ref_mask & (deviation > WIND_SPEED_DEVIATION_THRESHOLD)
+        data.loc[err_dev_mask, "is_sensor_error"] = True
+
+        # Create reason strings for all rows potentially affected by err_dev_mask
+        # These will be NaN where err_dev_mask is False, which is fine.
+        err_low_mask = err_dev_mask & (
+            turbine_wind < (avg_ref_wind - WIND_SPEED_DEVIATION_THRESHOLD)
+        )
+        err_anom_mask = err_dev_mask & ~(
+            turbine_wind < (avg_ref_wind - WIND_SPEED_DEVIATION_THRESHOLD)
+        )
+        data.loc[err_low_mask, "sensor_error_type"] = "SENSOR_ERROR_LOW"
+        data.loc[err_anom_mask, "sensor_error_type"] = "SENSOR_ERROR_ANOMALOUS"
+
+        # Construct the base deviation reason for all rows where err_dev_mask is True
+        # Initialize with a default or empty string
+        reason_for_deviation_error = pd.Series("", index=data.index, dtype=str)
+
+        # Populate for 'low' error type where err_low_mask is True
+        reason_for_deviation_error.loc[err_low_mask] = (
+            "Sensor error (low): Turbine "
+            + fmt_turbine_wind[err_low_mask]
+            + " vs Refs "
+            + fmt_avg_ref_wind[err_low_mask]
+            + "."
+        )
+        # Populate for 'anomalous' error type where err_anom_mask is True
+        # This will overwrite if a row was somehow both, but err_low_mask and err_anom_mask should be mutually exclusive under err_dev_mask
+        reason_for_deviation_error.loc[err_anom_mask] = (
+            "Sensor error (anom): Turbine "
+            + fmt_turbine_wind[err_anom_mask]
+            + " vs Refs "
+            + fmt_avg_ref_wind[err_anom_mask]
+            + "."
+        )
+
+        # If sensor error by deviation, wind condition based on refs
+        sensor_err_by_dev_ref_low = err_dev_mask & (avg_ref_wind < CUT_IN_WIND_SPEED)
+        data.loc[sensor_err_by_dev_ref_low, "wind_condition"] = "CONFIRMED_LOW_WIND"
+        data.loc[sensor_err_by_dev_ref_low, "assessment_reason"] = (
+            reason_for_deviation_error[
+                sensor_err_by_dev_ref_low
+            ]  # Select the pre-calculated reason
+            + " Refs indicate low wind; turbine sensor unreliable."
+        )
+        sensor_err_by_dev_ref_suff = err_dev_mask & ~(avg_ref_wind < CUT_IN_WIND_SPEED)
+        data.loc[sensor_err_by_dev_ref_suff, "wind_condition"] = "SUFFICIENT_CONFIRMED"
+        data.loc[sensor_err_by_dev_ref_suff, "assessment_reason"] = (
+            reason_for_deviation_error[
+                sensor_err_by_dev_ref_suff
+            ]  # Select the pre-calculated reason
+            + " Refs indicate sufficient wind; turbine sensor unreliable."
+        )
+
+        # No sensor error by deviation (but refs exist) - only apply if not already set by err_dev_mask
+        no_err_dev_mask = (
+            valid_ref_mask & ~err_dev_mask
+        )  # Note: is_sensor_error could be true from NaN case
+
+        # Both agree low
+        cond_both_low = (
+            no_err_dev_mask
+            & (turbine_wind < CUT_IN_WIND_SPEED)
+            & (avg_ref_wind < CUT_IN_WIND_SPEED)
+        )
+        data.loc[cond_both_low, "wind_condition"] = "CONFIRMED_LOW_WIND"
+        data.loc[cond_both_low, "assessment_reason"] = (
+            "Low wind: Turbine "
+            + fmt_turbine_wind[cond_both_low]
+            + ", Refs "
+            + fmt_avg_ref_wind[cond_both_low]
+            + ". Sensor consistent."
+        )
+
+        # Turbine low, refs high (no error)
+        cond_turb_low_ref_high = (
+            no_err_dev_mask
+            & (turbine_wind < CUT_IN_WIND_SPEED)
+            & ~(avg_ref_wind < CUT_IN_WIND_SPEED)
+        )
+        data.loc[cond_turb_low_ref_high, "wind_condition"] = "SUSPECTED_LOW_WIND"
+        data.loc[cond_turb_low_ref_high, "assessment_reason"] = (
+            "Turbine low ("
+            + fmt_turbine_wind[cond_turb_low_ref_high]
+            + "), refs higher ("
+            + fmt_avg_ref_wind[cond_turb_low_ref_high]
+            + "). Sensor reads low, refs higher (in tolerance)."
+        )
+
+        # Both agree sufficient
+        cond_both_suff = (
+            no_err_dev_mask
+            & ~(turbine_wind < CUT_IN_WIND_SPEED)
+            & ~(avg_ref_wind < CUT_IN_WIND_SPEED)
+        )
+        data.loc[cond_both_suff, "wind_condition"] = "SUFFICIENT_CONFIRMED"
+        data.loc[cond_both_suff, "assessment_reason"] = (
+            "Sufficient wind: Turbine "
+            + fmt_turbine_wind[cond_both_suff]
+            + ", Refs "
+            + fmt_avg_ref_wind[cond_both_suff]
+            + ". Sensor consistent."
+        )
+
+        # Turbine sufficient, refs low (no error)
+        cond_turb_suff_ref_low = (
+            no_err_dev_mask
+            & ~(turbine_wind < CUT_IN_WIND_SPEED)
+            & (avg_ref_wind < CUT_IN_WIND_SPEED)
+        )
+        data.loc[cond_turb_suff_ref_low, "wind_condition"] = (
+            "SUFFICIENT_CONFIRMED"  # Trust turbine if no error
+        )
+        data.loc[cond_turb_suff_ref_low, "assessment_reason"] = (
+            "Turbine sufficient ("
+            + fmt_turbine_wind[cond_turb_suff_ref_low]
+            + "), refs lower ("
+            + fmt_avg_ref_wind[cond_turb_suff_ref_low]
+            + "). Sensor reads sufficient, refs lower (in tolerance)."
+        )
+
+        # Valid turbine wind, NO references
+        no_ref_mask = valid_mask & (ref_count == 0)
+        data.loc[no_ref_mask, "sensor_reason"] = "No references to verify sensor."
+        no_ref_turb_low = no_ref_mask & (turbine_wind < CUT_IN_WIND_SPEED)
+        data.loc[no_ref_turb_low, "wind_condition"] = "SUSPECTED_LOW_WIND"
+        data.loc[no_ref_turb_low, "assessment_reason"] = (
+            "Suspected low wind on turbine sensor ("
+            + fmt_turbine_wind[no_ref_turb_low]
+            + "). No references to verify sensor or confirm wind."
+        )
+        no_ref_turb_suff = no_ref_mask & ~(turbine_wind < CUT_IN_WIND_SPEED)
+        data.loc[no_ref_turb_suff, "wind_condition"] = "SUFFICIENT_SUSPECTED"
+        data.loc[no_ref_turb_suff, "assessment_reason"] = (
+            "Suspected sufficient wind on turbine sensor ("
+            + fmt_turbine_wind[no_ref_turb_suff]
+            + "). No references to verify sensor or confirm wind."
+        )
+
+        return data
+
     def classify_turbine_states(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Classify operational states for all turbines in the dataset.
@@ -34,637 +418,244 @@ class OperationalStateClassifier:
         Returns:
             DataFrame with added operational state columns
         """
-        result_data = data.copy()
-
-        # Initialize state columns
-        result_data["operational_state"] = "UNKNOWN"
-        result_data["state_category"] = "Unknown"
-        result_data["state_subcategory"] = "Unknown"
-        result_data["state_reason"] = "Not classified"
-        result_data["is_producing"] = False
-
         if data.empty:
-            return data  # Return early if data is empty
+            # Add empty state columns if data is empty but columns are expected
+            for col in [
+                "operational_state",
+                "state_category",
+                "state_subcategory",
+                "state_reason",
+            ]:
+                data[col] = pd.NA
+            data["is_producing"] = False
+            return data
 
-        # Work on a copy to avoid modifying the original DataFrame
-        # Ensure TimeStamp is datetime for grouping and comparisons
+        # Work on a copy
+        df = data.copy()
+
         if not pd.api.types.is_datetime64_any_dtype(data["TimeStamp"]):
-            data["TimeStamp"] = pd.to_datetime(data["TimeStamp"])
+            df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
 
-        # Pre-group all data by timestamp for efficient lookup in _get_reference_wind_speeds
-        all_data_grouped_by_timestamp = {
-            ts: group for ts, group in data.groupby("TimeStamp")
-        }
+        # Pre-calculate all necessary intermediate conditions
+        df = self._pre_calculate_reference_winds(df)
+        df = self._pre_calculate_startup_conditions(
+            df
+        )  # Needs sorted data by StationId, TimeStamp
+        df = self._pre_calculate_wind_sensor_assessment(df)
 
-        # Cache for data_loader calls that are constant per turbine or globally
-        adjacent_turbines_cache = {}
-        global_metmast_columns = self.data_loader.get_metmast_columns()
+        # Define base conditions
+        cond_producing = df["wtc_ActPower_min"] > PRODUCTION_THRESHOLD_KW
+        cond_alarm = df["EffectiveAlarmTime"] > ALARM_THRESHOLD_SECONDS
+        cond_curtail_ext = df["wtc_PowerRed_timeon"] > CURTAILMENT_THRESHOLD_SECONDS
+        cond_curtail_int = df["Duration 2006(s)"] > CURTAILMENT_THRESHOLD_SECONDS
+        cond_curtailment = cond_curtail_ext | cond_curtail_int
 
-        processed_groups = []
-        # Sort data by StationId and TimeStamp to ensure correct temporal order for startup sequences
-        # and consistent processing.
-        data_sorted_for_processing = data.sort_values(["StationId", "TimeStamp"])
-
-        for station_id, group_df_original in data_sorted_for_processing.groupby(
-            "StationId", sort=False
-        ):
-            # Work on a copy of the group to avoid SettingWithCopyWarning on slices
-            group_df = group_df_original.copy()
-
-            # Initialize result columns for the current group
-            group_df["operational_state"] = "UNCLASSIFIED"  # Default placeholder
-            group_df["state_category"] = OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"][
-                "name"
-            ]  # Default to an unknown/unexpected
-            group_df["state_subcategory"] = OPERATIONAL_STATES[
-                "NOT_PRODUCING_UNEXPECTED"
-            ]["subcategories"]["UNKNOWN_NON_PRODUCTION"]
-            group_df["state_reason"] = "Pre-classification pending"
-            group_df["is_producing"] = False
-
-            # --- Vectorized Step 1: Producing ---
-            producing_mask = group_df["wtc_ActPower_min"] > PRODUCTION_THRESHOLD_KW
-            group_df.loc[producing_mask, "operational_state"] = "PRODUCING"
-            group_df.loc[producing_mask, "state_category"] = OPERATIONAL_STATES[
-                "PRODUCING"
-            ]["name"]
-            group_df.loc[producing_mask, "state_subcategory"] = OPERATIONAL_STATES[
-                "PRODUCING"
-            ]["subcategory"]
-            # Ensure wtc_ActPower_min is float for formatting; NaNs in wtc_ActPower_min make producing_mask False
-            power_val_str = (
-                group_df.loc[producing_mask, "wtc_ActPower_min"].round(1).astype(str)
-            )
-            group_df.loc[producing_mask, "state_reason"] = (
-                "Minimum Power output: " + power_val_str + " kW"
-            )
-            group_df.loc[producing_mask, "is_producing"] = True
-
-            # --- Vectorized Step 2: Alarm (only for non-producing rows) ---
-            # Comparisons with NaN yield False, so alarm_condition_mask handles NaNs in EffectiveAlarmTime
-            alarm_condition_mask = (
-                group_df["EffectiveAlarmTime"] > ALARM_THRESHOLD_SECONDS
-            )
-            alarm_mask = (~producing_mask) & alarm_condition_mask
-
-            group_df.loc[alarm_mask, "operational_state"] = "NOT_PRODUCING_EXPLAINED"
-            group_df.loc[alarm_mask, "state_category"] = OPERATIONAL_STATES[
-                "NOT_PRODUCING_EXPLAINED"
-            ]["name"]
-            group_df.loc[alarm_mask, "state_subcategory"] = OPERATIONAL_STATES[
-                "NOT_PRODUCING_EXPLAINED"
-            ]["subcategories"]["ALARM_ACTIVE"]
-            alarm_time_str = (
-                group_df.loc[alarm_mask, "EffectiveAlarmTime"].round(0).astype(str)
-            )
-            # 'UK Text' is a required column, fillna for safety in string concat
-            uk_text_str = group_df.loc[alarm_mask, "UK Text"].fillna("N/A").astype(str)
-            group_df.loc[alarm_mask, "state_reason"] = (
-                "Active alarm: " + alarm_time_str + "s - " + uk_text_str
-            )
-            group_df.loc[alarm_mask, "is_producing"] = False
-
-            # --- Vectorized Step 3: Curtailment (only for non-producing and non-alarm rows) ---
-            curtailment_external_cond_mask = (
-                group_df["wtc_PowerRed_timeon"] > CURTAILMENT_THRESHOLD_SECONDS
-            )
-            curtailment_internal_cond_mask = (
-                group_df["Duration 2006(s)"] > CURTAILMENT_THRESHOLD_SECONDS
-            )
-            any_curtailment_cond_mask = (
-                curtailment_external_cond_mask | curtailment_internal_cond_mask
-            )
-            curtailment_mask = (
-                (~producing_mask) & (~alarm_mask) & any_curtailment_cond_mask
-            )
-
-            # Determine reason string vectorially for curtailment
-            curtailment_reason_series = pd.Series("", index=group_df.index, dtype=str)
-            # External reason takes precedence if both are true for a row
-            curtailment_reason_series.loc[curtailment_internal_cond_mask] = (
-                "Internal (OEM) curtailment active"
-            )
-            curtailment_reason_series.loc[curtailment_external_cond_mask] = (
-                "External curtailment active"
-            )
-
-            group_df.loc[curtailment_mask, "operational_state"] = (
-                "NOT_PRODUCING_EXPLAINED"
-            )
-            group_df.loc[curtailment_mask, "state_category"] = OPERATIONAL_STATES[
-                "NOT_PRODUCING_EXPLAINED"
-            ]["name"]
-            group_df.loc[curtailment_mask, "state_subcategory"] = OPERATIONAL_STATES[
-                "NOT_PRODUCING_EXPLAINED"
-            ]["subcategories"]["CURTAILMENT_ACTIVE"]
-            group_df.loc[curtailment_mask, "state_reason"] = curtailment_reason_series[
-                curtailment_mask
-            ]
-            group_df.loc[curtailment_mask, "is_producing"] = False
-
-            # --- Rows still needing classification (iterative part) ---
-            # These are rows where 'operational_state' is still 'UNCLASSIFIED'
-            unclassified_indices = group_df[
-                group_df["operational_state"] == "UNCLASSIFIED"
-            ].index
-
-            if not unclassified_indices.empty:
-                # Fetch adjacent turbines and metmast info if not already cached for this turbine
-                if station_id not in adjacent_turbines_cache:
-                    adjacent_turbines_cache[station_id] = (
-                        self.data_loader.get_adjacent_turbines(station_id)
-                    )
-                current_adjacent_turbines = adjacent_turbines_cache[station_id]
-                # global_metmast_columns is already fetched once
-
-                for idx in unclassified_indices:
-                    row_series = group_df.loc[idx]
-
-                    # _classify_single_timestamp will re-check producing, alarm, curtailment.
-                    # This is slightly inefficient but simpler than refactoring _classify_single_timestamp
-                    # to start at a specific step. The main gain is from fewer iterations.
-                    state_info = self._classify_single_timestamp(
-                        row_series,
-                        group_df,  # Pass the full group_df (which includes its own history sorted by time)
-                        all_data_grouped_by_timestamp,
-                        current_adjacent_turbines,
-                        global_metmast_columns,
-                    )
-                    group_df.loc[idx, "operational_state"] = state_info["state"]
-                    group_df.loc[idx, "state_category"] = state_info["category"]
-                    group_df.loc[idx, "state_subcategory"] = state_info["subcategory"]
-                    group_df.loc[idx, "state_reason"] = state_info["reason"]
-                    group_df.loc[idx, "is_producing"] = state_info["is_producing"]
-
-            processed_groups.append(group_df)  # Append the fully classified group
-
-        if not processed_groups:
-            # If data was not empty but no groups were processed (e.g., no StationId),
-            # return the initial data copy with default classification columns.
-            return result_data
-
-        final_classified_data = pd.concat(processed_groups)
-        return final_classified_data.reindex(
-            result_data.index
-        )  # Restore original index order using result_data's index
-
-    def _classify_single_timestamp(
-        self,
-        row: pd.Series,
-        turbine_specific_history: pd.DataFrame,
-        all_data_grouped_by_timestamp: Dict,
-        adjacent_turbine_ids_for_row_station: List[str],
-        global_metmast_columns: List[str],
-    ) -> Dict[str, any]:
-        """
-        Classify operational state for a single timestamp.
-
-        Args:
-            row: Current timestamp data
-            turbine_specific_history: Historical data for this turbine (sorted by time)
-            all_data_grouped_by_timestamp: All turbine data, pre-grouped by timestamp
-            adjacent_turbine_ids_for_row_station: List of adjacent turbine IDs for the current row's station
-            global_metmast_columns: List of all metmast column names
-
-        Returns:
-            Dictionary with state classification information
-        """
-        timestamp = row["TimeStamp"]
-        power_min = row["wtc_ActPower_min"]
-
-        # Step 1: Check if producing
-        is_producing = power_min > PRODUCTION_THRESHOLD_KW
-
-        if is_producing:
-            return {
-                "state": "PRODUCING",
-                "category": OPERATIONAL_STATES["PRODUCING"]["name"],
-                "subcategory": OPERATIONAL_STATES["PRODUCING"]["subcategory"],
-                "reason": f"Minimum Power output: {power_min:.1f} kW",
-                "is_producing": True,
-            }
-
-        # Step 2: Not producing - determine why
-        # Check for active alarms (highest priority)
-        if row["EffectiveAlarmTime"] > ALARM_THRESHOLD_SECONDS:
-            return {
-                "state": "NOT_PRODUCING_EXPLAINED",
-                "category": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"]["name"],
-                "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"][
-                    "subcategories"
-                ]["ALARM_ACTIVE"],
-                "reason": f"Active alarm: {row['EffectiveAlarmTime']:.0f}s - {row.get('UK Text', 'N/A')}",
-                "is_producing": False,
-            }
-
-        # Check for curtailment
-        if (
-            row["wtc_PowerRed_timeon"] > CURTAILMENT_THRESHOLD_SECONDS
-            or row["Duration 2006(s)"] > CURTAILMENT_THRESHOLD_SECONDS
-        ):
-            curtailment_type = (
-                "External" if row["wtc_PowerRed_timeon"] > 0 else "Internal (OEM)"
-            )
-            return {
-                "state": "NOT_PRODUCING_EXPLAINED",
-                "category": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"]["name"],
-                "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"][
-                    "subcategories"
-                ]["CURTAILMENT_ACTIVE"],
-                "reason": f"{curtailment_type} curtailment active",
-                "is_producing": False,
-            }
-
-        # Step 4: Assess wind conditions and sensor integrity
-        wind_sensor_assessment = self._assess_wind_and_sensor(
-            row,
-            all_data_grouped_by_timestamp,
-            timestamp,
-            adjacent_turbine_ids_for_row_station,
-            global_metmast_columns,
+        # Pre-calculated boolean conditions from helper functions
+        cond_sensor_error = df["is_sensor_error"]
+        cond_confirmed_low_wind = df["wind_condition"] == "CONFIRMED_LOW_WIND"
+        cond_startup_post_lw = df["is_startup_post_low_wind"]
+        cond_startup_post_alarm = df["is_startup_post_alarm"]
+        cond_suspected_low_wind = df["wind_condition"] == "SUSPECTED_LOW_WIND"
+        cond_sufficient_wind = (df["wind_condition"] == "SUFFICIENT_CONFIRMED") | (
+            df["wind_condition"] == "SUFFICIENT_SUSPECTED"
         )
 
-        # Step 5: Check for sensor errors first
-        if wind_sensor_assessment["is_sensor_error"]:
-            return {
-                "state": "NOT_PRODUCING_UNEXPECTED",
-                "category": OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"]["name"],
-                "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"][
-                    "subcategories"
-                ][wind_sensor_assessment["sensor_error_type"]],
-                "reason": wind_sensor_assessment["wind_reason"],
-                "is_producing": False,
-            }
-
-        # Step 6: Check for low wind conditions (if sensor is okay)
-        wind_cond = wind_sensor_assessment["wind_condition"]
-        wind_reason = wind_sensor_assessment["wind_reason"]
-
-        if wind_cond == "CONFIRMED_LOW_WIND":
-            return {
-                "state": "NOT_PRODUCING_EXPLAINED",
-                "category": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"]["name"],
-                "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"][
-                    "subcategories"
-                ]["CONFIRMED_LOW_WIND"],
-                "reason": wind_reason,
-                "is_producing": False,
-            }
-
-        # Step 7: Check for startup sequences
-        startup_assessment = self._assess_startup_sequence(
-            row,
-            turbine_specific_history,
-            all_data_grouped_by_timestamp,  # Passed for future use, not currently used by method
-        )
-        if startup_assessment["is_startup"]:
-            if startup_assessment["trigger"] == "POST_LOW_WIND":
-                return {
-                    "state": "NOT_PRODUCING_EXPLAINED",
-                    "category": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"]["name"],
-                    "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"][
-                        "subcategories"
-                    ]["STARTUP_POST_LOW_WIND"],
-                    "reason": startup_assessment["reason"],
-                    "is_producing": False,
-                }
-            elif startup_assessment["trigger"] == "POST_ALARM":
-                return {
-                    "state": "NOT_PRODUCING_EXPLAINED",
-                    "category": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"]["name"],
-                    "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_EXPLAINED"][
-                        "subcategories"
-                    ]["STARTUP_POST_ALARM"],
-                    "reason": startup_assessment["reason"],
-                    "is_producing": False,
-                }
-            else:
-                return {
-                    "state": "NOT_PRODUCING_VERIFICATION_PENDING",
-                    "category": OPERATIONAL_STATES[
-                        "NOT_PRODUCING_VERIFICATION_PENDING"
-                    ]["name"],
-                    "subcategory": OPERATIONAL_STATES[
-                        "NOT_PRODUCING_VERIFICATION_PENDING"
-                    ]["subcategories"]["STARTUP_UNCLEAR"],
-                    "reason": startup_assessment["reason"],
-                    "is_producing": False,
-                }
-
-        # Step 8: If not sensor error, not confirmed low wind, and not startup,
-        # now consider SUSPECTED_LOW_WIND from sensor_ok assessment.
-        if wind_cond == "SUSPECTED_LOW_WIND":
-            return {
-                "state": "NOT_PRODUCING_VERIFICATION_PENDING",
-                "category": OPERATIONAL_STATES["NOT_PRODUCING_VERIFICATION_PENDING"][
-                    "name"
-                ],
-                "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_VERIFICATION_PENDING"][
-                    "subcategories"
-                ]["SUSPECTED_LOW_WIND"],
-                "reason": wind_reason,
-                "is_producing": False,
-            }
-
-        # Step 9: Check for mechanical/control issues (if wind is sufficient)
-        is_wind_sufficient_for_production = (
-            wind_cond == "SUFFICIENT_CONFIRMED" or wind_cond == "SUFFICIENT_SUSPECTED"
-        )
-        if is_wind_sufficient_for_production:
-            return {
-                "state": "NOT_PRODUCING_UNEXPECTED",
-                "category": OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"]["name"],
-                "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"][
-                    "subcategories"
-                ]["MECHANICAL_CONTROL_ISSUE"],
-                "reason": f"Sufficient wind ({wind_sensor_assessment['turbine_wind']:.1f} m/s, refs {wind_sensor_assessment['reference_wind_avg']:.1f} m/s) but not producing. {wind_reason}",
-                "is_producing": False,
-            }
-
-        # Step 10: Default case - unknown non-production
-        return {
-            "state": "NOT_PRODUCING_UNEXPECTED",
-            "category": OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"]["name"],
-            "subcategory": OPERATIONAL_STATES["NOT_PRODUCING_UNEXPECTED"][
-                "subcategories"
-            ]["UNKNOWN_NON_PRODUCTION"],
-            "reason": f"Unable to determine cause. Wind: {wind_cond} ({wind_reason}). Sensor: {wind_sensor_assessment['sensor_reason']}",
-            "is_producing": False,
-        }
-
-    def _assess_wind_and_sensor(
-        self,
-        row: pd.Series,
-        all_data_grouped_by_timestamp: Dict,
-        timestamp: datetime,
-        adjacent_turbine_ids_for_row_station: List[str],
-        global_metmast_columns: List[str],
-    ) -> Dict[str, any]:
-        """
-        Assess wind conditions and sensor integrity using turbine sensor and reference data.
-
-        Args:
-            row: Current timestamp data
-            all_data_grouped_by_timestamp: All data pre-grouped by timestamp
-            timestamp: Current timestamp
-            adjacent_turbine_ids_for_row_station: Adjacent turbine IDs for the current row's station
-            global_metmast_columns: List of metmast column names
-
-        Returns:
-            Dictionary with wind and sensor assessment results:
-            {
-                'is_sensor_error': bool,
-                'sensor_error_type': 'SENSOR_ERROR_LOW' | 'SENSOR_ERROR_ANOMALOUS' | None,
-                'sensor_reason': str,
-                'wind_condition': 'CONFIRMED_LOW_WIND' | 'SUSPECTED_LOW_WIND' |
-                                  'SUFFICIENT_CONFIRMED' | 'SUFFICIENT_SUSPECTED',
-                'wind_reason': str,
-                'turbine_wind': float,
-                'reference_wind_avg': float,
-                'reference_count': int
-            }
-        """
-        turbine_wind = row["wtc_AcWindSp_mean"]
-        ref_info = self._get_reference_wind_speeds(
-            all_data_grouped_by_timestamp,
-            timestamp,
-            adjacent_turbine_ids_for_row_station,
-            global_metmast_columns,
-        )
-        avg_ref_wind = ref_info["avg_reference"]
-        ref_count = ref_info["count"]
-
-        result = {
-            "is_sensor_error": False,
-            "sensor_error_type": None,
-            "sensor_reason": "",
-            "wind_condition": "",
-            "wind_reason": "",
-            "turbine_wind": turbine_wind,
-            "reference_wind_avg": avg_ref_wind,
-            "reference_count": ref_count,
-        }
-
-        # Handle NaN turbine wind speed data
-        turbine_wind_is_nan = pd.isna(turbine_wind)
-        if turbine_wind_is_nan:
-            # If turbine wind sensor is NaN, treat as sensor error and rely on references if available
-            result["is_sensor_error"] = True
-            result["sensor_error_type"] = "SENSOR_ERROR_ANOMALOUS"
-            result["sensor_reason"] = (
-                "Sensor error: Turbine wind speed data is missing/invalid (NaN)"
-            )
-
-            if ref_count > 0:
-                # Use references to determine wind condition
-                if avg_ref_wind < CUT_IN_WIND_SPEED:
-                    result["wind_condition"] = "CONFIRMED_LOW_WIND"
-                    result["wind_reason"] = (
-                        f"Turbine sensor data is missing/invalid. References ({avg_ref_wind:.1f} m/s) indicate low wind."
-                    )
-                else:
-                    result["wind_condition"] = "SUFFICIENT_CONFIRMED"
-                    result["wind_reason"] = (
-                        f"Turbine sensor data is missing/invalid. References ({avg_ref_wind:.1f} m/s) indicate sufficient wind."
-                    )
-            else:
-                # No references available, cannot determine wind condition reliably
-                result["wind_condition"] = (
-                    "SUFFICIENT_SUSPECTED"  # Default to suspected sufficient to trigger investigation
-                )
-                result["wind_reason"] = (
-                    "Turbine wind sensor data is missing/invalid (NaN). No references available to determine wind conditions."
-                )
-
-            return result
-
-        # Continue with normal processing for non-NaN turbine wind values
-        if ref_count > 0:
-            deviation = abs(turbine_wind - avg_ref_wind)
-            if deviation > WIND_SPEED_DEVIATION_THRESHOLD:
-                result["is_sensor_error"] = True
-                if turbine_wind < (avg_ref_wind - WIND_SPEED_DEVIATION_THRESHOLD):
-                    result["sensor_error_type"] = "SENSOR_ERROR_LOW"
-                    result["sensor_reason"] = (
-                        f"Sensor error suspected (low reading): Turbine {turbine_wind:.1f} m/s vs references {avg_ref_wind:.1f} m/s"
-                    )
-                else:
-                    result["sensor_error_type"] = "SENSOR_ERROR_ANOMALOUS"
-                    result["sensor_reason"] = (
-                        f"Sensor error suspected (anomalous reading): Turbine {turbine_wind:.1f} m/s vs references {avg_ref_wind:.1f} m/s"
-                    )
-
-                # If sensor error, wind condition is based on (presumably more reliable) references
-                if avg_ref_wind < CUT_IN_WIND_SPEED:
-                    result["wind_condition"] = "CONFIRMED_LOW_WIND"
-                    result["wind_reason"] = (
-                        f"References ({avg_ref_wind:.1f} m/s) indicate low wind. Turbine sensor ({turbine_wind:.1f} m/s) reading is unreliable."
-                    )
-                else:
-                    result["wind_condition"] = "SUFFICIENT_CONFIRMED"
-                    result["wind_reason"] = (
-                        f"References ({avg_ref_wind:.1f} m/s) indicate sufficient wind. Turbine sensor ({turbine_wind:.1f} m/s) reading is unreliable."
-                    )
-                return result  # Early exit if sensor error is definitive
-
-            # No major sensor error detected, proceed with wind assessment using both turbine and ref
-            if turbine_wind < CUT_IN_WIND_SPEED:
-                if avg_ref_wind < CUT_IN_WIND_SPEED:  # Both agree
-                    result["wind_condition"] = "CONFIRMED_LOW_WIND"
-                    result["wind_reason"] = (
-                        f"Low wind confirmed: Turbine {turbine_wind:.1f} m/s, References avg {avg_ref_wind:.1f} m/s."
-                    )
-                    result["sensor_reason"] = (
-                        "Sensor reading consistent with references for low wind."
-                    )
-                else:  # Turbine low, refs high, but deviation not enough for error
-                    result["wind_condition"] = "SUSPECTED_LOW_WIND"
-                    result["wind_reason"] = (
-                        f"Turbine reads low wind ({turbine_wind:.1f} m/s), references higher ({avg_ref_wind:.1f} m/s) but deviation within tolerance. Suspected low wind at turbine."
-                    )
-                    result["sensor_reason"] = (
-                        "Sensor shows low wind, references are higher but within tolerance."
-                    )
-            else:
-                if avg_ref_wind >= CUT_IN_WIND_SPEED:  # Both agree
-                    result["wind_condition"] = "SUFFICIENT_CONFIRMED"
-                    result["wind_reason"] = (
-                        f"Sufficient wind confirmed: Turbine {turbine_wind:.1f} m/s, References avg {avg_ref_wind:.1f} m/s."
-                    )
-                    result["sensor_reason"] = (
-                        "Sensor reading consistent with references for sufficient wind."
-                    )
-                else:  # Turbine high, refs low, but deviation not enough for error
-                    result["wind_condition"] = (
-                        "SUFFICIENT_CONFIRMED"  # Trust turbine if sensor not flagged as error
-                    )
-                    result["wind_reason"] = (
-                        f"Turbine reads sufficient wind ({turbine_wind:.1f} m/s), references lower ({avg_ref_wind:.1f} m/s) but deviation within tolerance. Assuming sufficient wind at turbine."
-                    )
-                    result["sensor_reason"] = (
-                        "Sensor shows sufficient wind, references are lower but within tolerance."
-                    )
-        else:
-            result["sensor_reason"] = (
-                "No references available to verify sensor integrity."
-            )
-            if turbine_wind < CUT_IN_WIND_SPEED:
-                result["wind_condition"] = "SUSPECTED_LOW_WIND"
-                result["wind_reason"] = (
-                    f"Low wind suspected on turbine sensor ({turbine_wind:.1f} m/s). No references to confirm or check sensor."
-                )
-            else:
-                result["wind_condition"] = "SUFFICIENT_SUSPECTED"
-                result["wind_reason"] = (
-                    f"Sufficient wind suspected on turbine sensor ({turbine_wind:.1f} m/s). No references to confirm or check sensor."
-                )
-
-        return result
-
-    def _get_reference_wind_speeds(
-        self,
-        all_data_grouped_by_timestamp: Dict,
-        timestamp: datetime,
-        adjacent_turbine_ids_list: List[str],
-        metmast_column_names_list: List[str],
-    ) -> Dict[str, float]:
-        """Get reference wind speeds from adjacent turbines and metmasts."""
-
-        timestamp_specific_data = all_data_grouped_by_timestamp.get(timestamp)
-        if timestamp_specific_data is None or timestamp_specific_data.empty:
-            return {"avg_reference": 0.0, "count": 0, "values": []}
-
-        reference_speeds = []
-
-        if timestamp_specific_data is not None:
-            # Adjacent turbines wind speeds
-            if (
-                "StationId" in timestamp_specific_data.columns
-                and "wtc_AcWindSp_mean" in timestamp_specific_data.columns
-            ):
-                adj_turbines_data_at_ts = timestamp_specific_data[
-                    timestamp_specific_data["StationId"].isin(adjacent_turbine_ids_list)
-                ]
-                if not adj_turbines_data_at_ts.empty:
-                    valid_speeds = adj_turbines_data_at_ts["wtc_AcWindSp_mean"].dropna()
-                    if not valid_speeds.empty:
-                        reference_speeds.extend(
-                            valid_speeds.values
-                        )  # Use .values for NumPy array
-
-            # Get metmast data
-            for met_col in metmast_column_names_list:
-                if met_col in timestamp_specific_data.columns:
-                    met_series_at_ts = timestamp_specific_data[met_col].dropna()
-                    if not met_series_at_ts.empty:
-                        # Take the first valid value directly as a scalar
-                        reference_speeds.append(met_series_at_ts.iloc[0])
-
-        if reference_speeds:
-            avg_ref = np.mean(reference_speeds) if reference_speeds else 0.0
-            return {
-                "avg_reference": avg_ref,
-                "count": len(reference_speeds),
-                "values": reference_speeds,
-            }
-
-        return {"avg_reference": 0.0, "count": 0, "values": []}
-
-    def _assess_startup_sequence(
-        self,
-        row: pd.Series,
-        turbine_specific_history: pd.DataFrame,
-        all_data_grouped_by_timestamp: Dict,
-    ) -> Dict[
-        str, any
-    ]:  # all_data_grouped_by_timestamp not used by current logic but passed for consistency/future
-        """Assess if turbine is in startup sequence."""
-        current_time = row["TimeStamp"]
-
-        # Look at previous timestamps (last 30 minutes)
-        lookback_time = current_time - timedelta(
-            minutes=30
-        )  # turbine_specific_history is already sorted by TimeStamp
-        recent_data = turbine_specific_history[
-            (turbine_specific_history["TimeStamp"] >= lookback_time)
-            & (turbine_specific_history["TimeStamp"] < current_time)
+        # Hierarchical conditions for np.select
+        conditions = [
+            cond_producing,
+            ~cond_producing & cond_alarm,
+            ~cond_producing & ~cond_alarm & cond_curtailment,
+            ~cond_producing & ~cond_alarm & ~cond_curtailment & cond_sensor_error,
+            ~cond_producing
+            & ~cond_alarm
+            & ~cond_curtailment
+            & ~cond_sensor_error
+            & cond_confirmed_low_wind,
+            ~cond_producing
+            & ~cond_alarm
+            & ~cond_curtailment
+            & ~cond_sensor_error
+            & ~cond_confirmed_low_wind
+            & cond_startup_post_lw,
+            ~cond_producing
+            & ~cond_alarm
+            & ~cond_curtailment
+            & ~cond_sensor_error
+            & ~cond_confirmed_low_wind
+            & ~cond_startup_post_lw
+            & cond_startup_post_alarm,
+            ~cond_producing
+            & ~cond_alarm
+            & ~cond_curtailment
+            & ~cond_sensor_error
+            & ~cond_confirmed_low_wind
+            & ~cond_startup_post_lw
+            & ~cond_startup_post_alarm
+            & cond_suspected_low_wind,
+            ~cond_producing
+            & ~cond_alarm
+            & ~cond_curtailment
+            & ~cond_sensor_error
+            & ~cond_confirmed_low_wind
+            & ~cond_startup_post_lw
+            & ~cond_startup_post_alarm
+            & ~cond_suspected_low_wind
+            & cond_sufficient_wind,
         ]
 
-        if recent_data.empty:
-            return {"is_startup": False, "trigger": None, "reason": "No recent data"}
+        # Choices for each column
+        O_S = OPERATIONAL_STATES  # Alias
 
-        # Check for recent low wind recovery
-        recent_low_wind = recent_data[
-            recent_data["wtc_AcWindSp_mean"] < CUT_IN_WIND_SPEED
+        choices_op_state = [
+            "PRODUCING",
+            "NOT_PRODUCING_EXPLAINED",
+            "NOT_PRODUCING_EXPLAINED",
+            "NOT_PRODUCING_UNEXPECTED",
+            "NOT_PRODUCING_EXPLAINED",
+            "NOT_PRODUCING_EXPLAINED",
+            "NOT_PRODUCING_EXPLAINED",
+            "NOT_PRODUCING_VERIFICATION_PENDING",
+            "NOT_PRODUCING_UNEXPECTED",
         ]
-        if not recent_low_wind.empty:
-            last_low_wind = recent_low_wind.iloc[-1]
-            time_since_low_wind = (
-                current_time - last_low_wind["TimeStamp"]
-            ).total_seconds() / 60
-            if time_since_low_wind <= 20:  # Within 20 minutes
-                return {
-                    "is_startup": True,
-                    "trigger": "POST_LOW_WIND",
-                    "reason": f"Startup sequence: {time_since_low_wind:.0f} min after low wind recovery",
-                }
+        choices_category = [
+            O_S["PRODUCING"]["name"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["name"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["name"],
+            O_S["NOT_PRODUCING_UNEXPECTED"]["name"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["name"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["name"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["name"],
+            O_S["NOT_PRODUCING_VERIFICATION_PENDING"]["name"],
+            O_S["NOT_PRODUCING_UNEXPECTED"]["name"],
+        ]
+        # For subcategory, sensor_error_type is a Series, np.select handles this.
+        # Ensure it has a default for rows not matching the sensor_error condition but needing a default for this choice slot.
+        default_sensor_subcategory = O_S["NOT_PRODUCING_UNEXPECTED"]["subcategories"][
+            "SENSOR_ERROR_ANOMALOUS"
+        ]
+        sensor_error_type_choice = df["sensor_error_type"].fillna(
+            default_sensor_subcategory
+        )
 
-        # Check for recent alarm clearance
-        recent_alarms = recent_data[recent_data["EffectiveAlarmTime"] > 0]
-        if not recent_alarms.empty:
-            last_alarm = recent_alarms.iloc[-1]
-            time_since_alarm = (
-                current_time - last_alarm["TimeStamp"]
-            ).total_seconds() / 60
-            if time_since_alarm <= 15:  # Within 15 minutes
-                return {
-                    "is_startup": True,
-                    "trigger": "POST_ALARM",
-                    "reason": f"Startup sequence: {time_since_alarm:.0f} min after alarm clearance",
-                }
+        choices_subcategory = [
+            O_S["PRODUCING"]["subcategory"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["ALARM_ACTIVE"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["CURTAILMENT_ACTIVE"],
+            sensor_error_type_choice,  # Uses the Series
+            O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["CONFIRMED_LOW_WIND"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["STARTUP_POST_LOW_WIND"],
+            O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["STARTUP_POST_ALARM"],
+            O_S["NOT_PRODUCING_VERIFICATION_PENDING"]["subcategories"][
+                "SUSPECTED_LOW_WIND"
+            ],
+            O_S["NOT_PRODUCING_UNEXPECTED"]["subcategories"][
+                "MECHANICAL_CONTROL_ISSUE"
+            ],
+        ]
+        choices_is_producing = [
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+        ]
 
-        return {
-            "is_startup": False,
-            "trigger": None,
-            "reason": "Not in startup sequence",
-        }
+        # Default choices
+        default_op_state = "NOT_PRODUCING_UNEXPECTED"
+        default_cat = O_S["NOT_PRODUCING_UNEXPECTED"]["name"]
+        default_subcat = O_S["NOT_PRODUCING_UNEXPECTED"]["subcategories"][
+            "UNKNOWN_NON_PRODUCTION"
+        ]
+        default_prod = False
+
+        df["operational_state"] = np.select(
+            conditions, choices_op_state, default=default_op_state
+        )
+        df["state_category"] = np.select(
+            conditions, choices_category, default=default_cat
+        )
+        df["state_subcategory"] = np.select(
+            conditions, choices_subcategory, default=default_subcat
+        )
+        df["is_producing"] = np.select(
+            conditions, choices_is_producing, default=default_prod
+        )
+
+        # Reason strings
+        reason_producing = (
+            "Minimum Power output: "
+            + df["wtc_ActPower_min"].round(1).astype(str)
+            + " kW"
+        )
+        reason_alarm = (
+            "Active alarm: "
+            + df["EffectiveAlarmTime"].round(0).astype(str)
+            + "s - "
+            + df["UK Text"].fillna("N/A").astype(str)
+        )
+
+        reason_curtailment = pd.Series("", index=df.index, dtype=str)
+        reason_curtailment[cond_curtail_int] = "Internal (OEM) curtailment active"
+        reason_curtailment[cond_curtail_ext] = (
+            "External curtailment active"  # External takes precedence
+        )
+
+        # assessment_reason is now the primary source for wind/sensor related explanations
+        assessment_reason_filled = df["assessment_reason"].fillna(
+            "Assessment details not available"
+        )
+
+        reason_startup = df["startup_reason_details"].fillna(
+            ""
+        )  # Covers both startup types
+
+        reason_mech_control = "Not producing despite " + assessment_reason_filled
+
+        default_reason_str = (
+            "Unknown non-production. Assessment: " + assessment_reason_filled
+        )
+
+        choices_reason = [
+            reason_producing,
+            reason_alarm,
+            reason_curtailment,
+            assessment_reason_filled,  # For cond_sensor_error
+            assessment_reason_filled,  # For cond_confirmed_low_wind
+            reason_startup,
+            reason_startup,  # Startup reason covers both
+            assessment_reason_filled,  # For cond_suspected_low_wind
+            reason_mech_control,
+        ]
+        df["state_reason"] = np.select(
+            conditions, choices_reason, default=default_reason_str
+        )
+
+        # Clean up temporary columns (adjust list as needed)
+        temp_cols = [
+            "adj_turbine_ref_wind_avg",
+            "adj_turbine_ref_count",
+            "metmast_ref_wind_avg",
+            "metmast_ref_count",
+            "combined_ref_wind_avg",
+            "combined_ref_count",
+            "is_low_wind_event_point",
+            "low_wind_event_time",
+            "last_recorded_low_wind_time",
+            "is_alarm_active_event_point",
+            "alarm_event_time",
+            "last_recorded_alarm_time",
+            "is_startup_post_low_wind",
+            "is_startup_post_alarm",
+            "startup_reason_details",
+            "is_sensor_error",
+            "sensor_error_type",
+            "wind_condition",
+            "assessment_reason",  # Add new consolidated reason to temp_cols to be dropped
+        ]
+        df.drop(columns=[col for col in temp_cols if col in df.columns], inplace=True)
+
+        return df
