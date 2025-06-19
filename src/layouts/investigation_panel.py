@@ -8,8 +8,6 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from ..utils.config import CHART_HEIGHT
-
 
 def create_investigation_panel_layout(selected_turbine: str = None):
     """Create the investigation panel layout for a selected turbine."""
@@ -75,7 +73,10 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                     dbc.Card(
                                         [
                                             dbc.CardHeader(
-                                                html.H5("Analysis Period Metrics", className="mb-0")
+                                                html.H5(
+                                                    "Analysis Period Metrics",
+                                                    className="mb-0",
+                                                )
                                             ),
                                             dbc.CardBody(
                                                 [
@@ -139,50 +140,17 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                                             dbc.CardHeader(
                                                 [
                                                     html.H5(
-                                                        "Power Output and Operational State Analysis",
+                                                        "Comprehensive Time Series Analysis",
                                                         className="mb-0",
                                                     )
-                                                ]
+                                                ],
+                                                className="sticky-top bg-light",  # Make header sticky if chart scrolls
                                             ),
                                             dbc.CardBody(
                                                 [
                                                     dcc.Graph(
-                                                        id="power-analysis-chart",
-                                                        style={
-                                                            "height": f"{CHART_HEIGHT}px"
-                                                        },
-                                                    )
-                                                ]
-                                            ),
-                                        ]
-                                    )
-                                ],
-                                width=12,
-                            )
-                        ],
-                        className="mb-4",
-                    ),
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                [
-                                    dbc.Card(
-                                        [
-                                            dbc.CardHeader(
-                                                [
-                                                    html.H5(
-                                                        "Wind Speed Comparison",
-                                                        className="mb-0",
-                                                    )
-                                                ]
-                                            ),
-                                            dbc.CardBody(
-                                                [
-                                                    dcc.Graph(
-                                                        id="wind-comparison-chart",
-                                                        style={
-                                                            "height": f"{CHART_HEIGHT}px"
-                                                        },
+                                                        id="combined-investigation-chart",
+                                                        # Height will be set in the figure layout by the callback
                                                     )
                                                 ]
                                             ),
@@ -195,36 +163,9 @@ def create_investigation_panel_layout(selected_turbine: str = None):
                         className="mb-4",
                     ),
                     # Alarm and Curtailment Analysis
-                    dbc.Row(
-                        [
-                            dbc.Col(
-                                [
-                                    dbc.Card(
-                                        [
-                                            dbc.CardHeader(
-                                                html.H5(
-                                                    "Alarm & Curtailment History",
-                                                    className="mb-0",
-                                                )
-                                            ),
-                                            dbc.CardBody(
-                                                [
-                                                    dcc.Graph(
-                                                        id="alarm-curtailment-chart",
-                                                        style={
-                                                            "height": f"{CHART_HEIGHT}px"
-                                                        },
-                                                    )
-                                                ]
-                                            ),
-                                        ]
-                                    )
-                                ],
-                                width=12,
-                            ),
-                        ],
-                        className="mb-4",
-                    ),
+                    # This section is now part of the combined chart above.
+                    # If specific non-graphical elements related to alarms/curtailments are needed,
+                    # they can be added here or elsewhere.
                     # Detailed Data Table
                     dbc.Row(
                         [
@@ -289,32 +230,59 @@ def create_investigation_panel_layout(selected_turbine: str = None):
     )
 
 
-def create_power_analysis_chart(turbine_data, adjacent_data=None):
-    """Create power output analysis chart."""
+def create_combined_investigation_chart(
+    turbine_data, adjacent_data=None, metmast_data=None
+):
+    """
+    Create a combined investigation chart with Power, Operational State, Wind Speed,
+    and Alarm/Curtailment data as subplots sharing the same x-axis.
+    """
+    if turbine_data is None or turbine_data.empty:
+        return go.Figure()  # Return empty figure if no data
+
+    # Define subplot titles and row heights
+    # Adjusted CHART_HEIGHT to be a bit taller for the combined view.
+    # Each original chart was CHART_HEIGHT (e.g., 450px).
+    # For 6 subplots, we need a taller figure. Let's aim for ~1000-1200px.
+    total_height = 1200  # Increased height for 6 subplots
+    row_heights = [
+        0.22,
+        0.13,
+        0.22,
+        0.11,
+        0.11,
+        0.11,
+    ]  # Sum to 0.9, leaves space for titles/spacing
+
     fig = make_subplots(
-        rows=2,
+        rows=6,
         cols=1,
-        subplot_titles=("Power Output", "Operational State"),
-        vertical_spacing=0.15,  # Increased spacing to prevent overlap
-        row_heights=[0.7, 0.3],
-        shared_xaxes=True,  # Link x-axis zoom between subplots
+        shared_xaxes=True,
+        vertical_spacing=0.04,  # Adjust spacing between subplots
+        subplot_titles=(
+            "Power Output (kW)",
+            "Operational State",
+            "Wind Speed (m/s)",
+            "Alarm Duration (s)",
+            "External Curtailment (s)",
+            "Internal Curtailment (s)",
+        ),
+        row_heights=row_heights,
     )
 
-    # Power output line
+    # --- Row 1: Power Output ---
     fig.add_trace(
         go.Scatter(
             x=turbine_data["TimeStamp"],
             y=turbine_data["wtc_ActPower_mean"],
             mode="lines+markers",
-            name="Power Output",
+            name=f"{turbine_data['StationId'].iloc[0]} Power",
             line=dict(color="blue", width=2),
             marker=dict(size=4),
         ),
         row=1,
         col=1,
     )
-
-    # Add adjacent turbines if provided
     if adjacent_data is not None and not adjacent_data.empty:
         for station_id in adjacent_data["StationId"].unique():
             adj_turbine_data = adjacent_data[adjacent_data["StationId"] == station_id]
@@ -323,69 +291,52 @@ def create_power_analysis_chart(turbine_data, adjacent_data=None):
                     x=adj_turbine_data["TimeStamp"],
                     y=adj_turbine_data["wtc_ActPower_mean"],
                     mode="lines",
-                    name=f"{station_id} (Adjacent)",
+                    name=f"{station_id} Power (Adj.)",
                     line=dict(width=1),
                     opacity=0.6,
                 ),
                 row=1,
                 col=1,
             )
+    fig.update_yaxes(title_text="Power (kW)", row=1, col=1)
 
-    # Operational state indicators
+    # --- Row 2: Operational State ---
     state_colors = {
         "PRODUCING": "green",
-        "NOT_PRODUCING_EXPLAINED": "yellow",
+        "NOT_PRODUCING_EXPLAINED": "gold",  # Changed from yellow for better visibility
         "NOT_PRODUCING_VERIFICATION_PENDING": "orange",
         "NOT_PRODUCING_UNEXPECTED": "red",
         "OFFLINE_MAINTENANCE": "gray",
     }
-
     for state, color in state_colors.items():
         state_data = turbine_data[turbine_data["operational_state"] == state]
         if not state_data.empty:
             fig.add_trace(
                 go.Scatter(
                     x=state_data["TimeStamp"],
-                    y=[1] * len(state_data),
+                    y=[1] * len(state_data),  # Plot on a simple y-axis
                     mode="markers",
                     name=state.replace("_", " ").title(),
                     marker=dict(color=color, size=8, symbol="square"),
-                    showlegend=True,
                 ),
                 row=2,
                 col=1,
             )
+    fig.update_yaxes(title_text="State", showticklabels=False, row=2, col=1)
 
-    fig.update_xaxes(title_text="Time", row=2, col=1)
-    fig.update_yaxes(title_text="Power (kW)", row=1, col=1)
-    fig.update_yaxes(title_text="State", row=2, col=1, showticklabels=False)
-
-    fig.update_layout(
-        height=CHART_HEIGHT,
-        hovermode="x unified",
-        margin=dict(t=60, b=50, l=60, r=20)  # Added margins for better spacing
-    )
-
-    return fig
-
-
-def create_wind_comparison_chart(turbine_data, adjacent_data=None, metmast_data=None):
-    """Create wind speed comparison chart."""
-    fig = go.Figure()
-
-    # Main turbine wind speed
+    # --- Row 3: Wind Speed ---
     fig.add_trace(
         go.Scatter(
             x=turbine_data["TimeStamp"],
             y=turbine_data["wtc_AcWindSp_mean"],
             mode="lines+markers",
-            name="Turbine Wind Speed",
+            name=f"{turbine_data['StationId'].iloc[0]} Wind",
             line=dict(color="blue", width=2),
             marker=dict(size=4),
-        )
+        ),
+        row=3,
+        col=1,
     )
-
-    # Adjacent turbines
     if adjacent_data is not None and not adjacent_data.empty:
         for station_id in adjacent_data["StationId"].unique():
             adj_turbine_data = adjacent_data[adjacent_data["StationId"] == station_id]
@@ -394,97 +345,82 @@ def create_wind_comparison_chart(turbine_data, adjacent_data=None, metmast_data=
                     x=adj_turbine_data["TimeStamp"],
                     y=adj_turbine_data["wtc_AcWindSp_mean"],
                     mode="lines",
-                    name=f"{station_id} Wind",
+                    name=f"{station_id} Wind (Adj.)",
                     line=dict(width=1),
                     opacity=0.7,
-                )
+                ),
+                row=3,
+                col=1,
             )
-
-    # Metmast data
     if metmast_data is not None:
         for col in metmast_data.columns:
             if col.startswith("met_WindSpeedRot_mean_"):
                 metmast_id = col.split("_")[-1]
                 fig.add_trace(
                     go.Scatter(
-                        x=metmast_data.index,
+                        x=metmast_data.index,  # Assuming metmast_data index is TimeStamp
                         y=metmast_data[col],
                         mode="lines",
                         name=f"Metmast {metmast_id}",
                         line=dict(dash="dash", width=2),
-                        connectgaps=False,  # Don't connect gaps in data to prevent loops
-                    )
+                        connectgaps=False,
+                    ),
+                    row=3,
+                    col=1,
                 )
+    fig.update_yaxes(title_text="Wind (m/s)", row=3, col=1)
 
-    fig.update_layout(
-        xaxis_title="Time",
-        yaxis_title="Wind Speed (m/s)",
-        height=CHART_HEIGHT,
-        hovermode="x unified",
-        margin=dict(t=60, b=50, l=60, r=20)  # Added margins for better spacing
-    )
-
-    return fig
-
-
-def create_alarm_curtailment_chart(turbine_data):
-    """Create alarm and curtailment analysis chart."""
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        subplot_titles=(
-            "Alarm Duration",
-            "External Curtailment",
-            "Internal Curtailment",
-        ),
-        vertical_spacing=0.12,  # Optimized spacing to prevent overlap while fitting in card
-    )
-
-    # Alarm duration
+    # --- Row 4: Alarm Duration ---
     fig.add_trace(
         go.Bar(
             x=turbine_data["TimeStamp"],
             y=turbine_data["EffectiveAlarmTime"],
             name="Alarm Duration",
             marker_color="red",
+            showlegend=False,  # Subplot title is enough
         ),
-        row=1,
+        row=4,
         col=1,
     )
+    fig.update_yaxes(title_text="Seconds", row=4, col=1)
 
-    # External curtailment
+    # --- Row 5: External Curtailment ---
     fig.add_trace(
         go.Bar(
             x=turbine_data["TimeStamp"],
             y=turbine_data["wtc_PowerRed_timeon"],
             name="External Curtailment",
             marker_color="orange",
+            showlegend=False,
         ),
-        row=2,
+        row=5,
         col=1,
     )
+    fig.update_yaxes(title_text="Seconds", row=5, col=1)
 
-    # Internal curtailment
+    # --- Row 6: Internal Curtailment ---
     fig.add_trace(
         go.Bar(
             x=turbine_data["TimeStamp"],
             y=turbine_data["Duration 2006(s)"],
             name="Internal Curtailment",
-            marker_color="yellow",
+            marker_color="gold",  # Changed from yellow
+            showlegend=False,
         ),
-        row=3,
+        row=6,
         col=1,
     )
+    fig.update_yaxes(title_text="Seconds", row=6, col=1)
 
-    fig.update_xaxes(title_text="Time", row=3, col=1)
-    fig.update_yaxes(title_text="Seconds", row=1, col=1)
-    fig.update_yaxes(title_text="Seconds", row=2, col=1)
-    fig.update_yaxes(title_text="Seconds", row=3, col=1)
-
+    # --- General Layout Updates ---
+    fig.update_xaxes(
+        title_text="Time", row=6, col=1
+    )  # Show x-axis title only on the last subplot
     fig.update_layout(
-        height=CHART_HEIGHT,  # Keep original height to fit in card
-        showlegend=False,
-        margin=dict(t=60, b=50, l=60, r=20)  # Optimized margins to fit within card
+        height=total_height,
+        hovermode="x unified",  # Unified hover for all subplots
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=80, b=50, l=70, r=30),  # Adjusted margins
     )
 
     return fig
