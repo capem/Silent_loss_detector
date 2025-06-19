@@ -258,7 +258,7 @@ def create_combined_investigation_chart(
         rows=6,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.04,  # Adjust spacing between subplots
+        vertical_spacing=0.06,  # Slightly increased spacing for better legend placement
         subplot_titles=(
             "Power Output (kW)",
             "Operational State",
@@ -279,6 +279,8 @@ def create_combined_investigation_chart(
             name=f"{turbine_data['StationId'].iloc[0]} Power",
             line=dict(color="blue", width=2),
             marker=dict(size=4),
+            legendgroup="power",
+            legendgrouptitle_text="Power Output",
         ),
         row=1,
         col=1,
@@ -294,6 +296,7 @@ def create_combined_investigation_chart(
                     name=f"{station_id} Power (Adj.)",
                     line=dict(width=1),
                     opacity=0.6,
+                    legendgroup="power",
                 ),
                 row=1,
                 col=1,
@@ -318,6 +321,8 @@ def create_combined_investigation_chart(
                     mode="markers",
                     name=state.replace("_", " ").title(),
                     marker=dict(color=color, size=8, symbol="square"),
+                    legendgroup="operational_state",
+                    legendgrouptitle_text="Operational State",
                 ),
                 row=2,
                 col=1,
@@ -333,6 +338,8 @@ def create_combined_investigation_chart(
             name=f"{turbine_data['StationId'].iloc[0]} Wind",
             line=dict(color="blue", width=2),
             marker=dict(size=4),
+            legendgroup="wind_speed",
+            legendgrouptitle_text="Wind Speed",
         ),
         row=3,
         col=1,
@@ -348,6 +355,7 @@ def create_combined_investigation_chart(
                     name=f"{station_id} Wind (Adj.)",
                     line=dict(width=1),
                     opacity=0.7,
+                    legendgroup="wind_speed",
                 ),
                 row=3,
                 col=1,
@@ -364,6 +372,7 @@ def create_combined_investigation_chart(
                         name=f"Metmast {metmast_id}",
                         line=dict(dash="dash", width=2),
                         connectgaps=False,
+                        legendgroup="wind_speed",
                     ),
                     row=3,
                     col=1,
@@ -419,8 +428,21 @@ def create_combined_investigation_chart(
     fig.update_layout(
         height=total_height,
         hovermode="x unified",  # Unified hover for all subplots
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(t=80, b=50, l=70, r=30),  # Adjusted margins
+        legend=dict(
+            orientation="v",  # Vertical orientation for better grouping
+            yanchor="top",
+            y=0.98,  # Position near the top
+            xanchor="left",
+            x=1.02,  # Position to the right of the chart
+            bgcolor="rgba(255,255,255,0.8)",  # Semi-transparent background
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1,
+            font=dict(size=10),  # Smaller font for compact legend
+            itemsizing="constant",  # Consistent item sizing
+            groupclick="toggleitem",  # Allow toggling individual items within groups
+        ),
+        margin=dict(t=60, b=50, l=70, r=150),  # Increased right margin for legend space
+        showlegend=True,
     )
 
     return fig
