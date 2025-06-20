@@ -13,7 +13,7 @@ def create_main_dashboard_layout():
     """Create the main dashboard layout."""
 
     return dbc.Container(
-        [
+[
             # Header
             dbc.Row(
                 [
@@ -151,9 +151,17 @@ def create_main_dashboard_layout():
                                                                 },
                                                                 multiple=False,
                                                             ),
-                                                            html.Div(
-                                                                id="upload-status",
-                                                                className="mt-2",
+                                                            dcc.Loading(
+                                                                type="default",
+                                                                children=html.Div(id="upload-status", className="mt-2"),
+                                                            ),
+                                                            dbc.Button(
+                                                                "Run Calculation",
+                                                                id="run-calculation-btn",
+                                                                color="primary",
+                                                                className="mt-3",
+                                                                disabled=True,
+                                                                n_clicks=0,
                                                             ),
                                                         ],
                                                         width=12,
@@ -212,9 +220,9 @@ def create_main_dashboard_layout():
                                                                 },
                                                                 multiple=False,
                                                             ),
-                                                            html.Div(
-                                                                id="layout-upload-status",
-                                                                className="mt-2",
+                                                            dcc.Loading(
+                                                                type="default",
+                                                                children=html.Div(id="layout-upload-status", className="mt-2"),
                                                             ),
                                                         ],
                                                         width=12,
@@ -239,64 +247,67 @@ def create_main_dashboard_layout():
                 [
                     dbc.Col(
                         [
-                            dbc.Card(
-                                [
-                                    dbc.CardHeader(
-                                        [
-                                            dbc.Row(
-                                                [
-                                                    dbc.Col(
-                                                        [
-                                                            html.Div(
-                                                                [
-                                                                    html.I(
-                                                                        className="fas fa-chart-bar me-2 text-primary"
-                                                                    ),
-                                                                    html.H4(
-                                                                        "Data Overview",
-                                                                        className="mb-0 d-inline",
-                                                                    ),
-                                                                ],
-                                                                className="d-flex align-items-center",
-                                                            )
-                                                        ],
-                                                        width=8,
-                                                    ),
-                                                    dbc.Col(
-                                                        [
-                                                            dbc.Button(
-                                                                [
-                                                                    html.I(
-                                                                        className="fas fa-download me-1"
-                                                                    ),
-                                                                    "Export Data",
-                                                                ],
-                                                                id="export-data-btn",
-                                                                color="primary",
-                                                                size="sm",
-                                                                outline=True,
-                                                                className="shadow-sm",
-                                                            )
-                                                        ],
-                                                        width=4,
-                                                        className="text-end",
-                                                    ),
-                                                ]
-                                            )
-                                        ],
-                                        className="bg-light border-0",
-                                    ),
-                                    dbc.CardBody(
-                                        [
-                                            html.Div(
-                                                id="data-summary",
-                                                children="No data loaded",
-                                            )
-                                        ],
-                                        className="p-3",
-                                    ),
-                                ],
-                                className="shadow-sm border-0 h-100",
+                            dcc.Loading(
+                                type="default",
+                                children=dbc.Card(
+                                    [
+                                        dbc.CardHeader(
+                                            [
+                                                dbc.Row(
+                                                    [
+                                                        dbc.Col(
+                                                            [
+                                                                html.Div(
+                                                                    [
+                                                                        html.I(
+                                                                            className="fas fa-chart-bar me-2 text-primary"
+                                                                        ),
+                                                                        html.H4(
+                                                                            "Data Overview",
+                                                                            className="mb-0 d-inline",
+                                                                        ),
+                                                                    ],
+                                                                    className="d-flex align-items-center",
+                                                                )
+                                                            ],
+                                                            width=8,
+                                                        ),
+                                                        dbc.Col(
+                                                            [
+                                                                dbc.Button(
+                                                                    [
+                                                                        html.I(
+                                                                            className="fas fa-download me-1"
+                                                                        ),
+                                                                        "Export Data",
+                                                                    ],
+                                                                    id="export-data-btn",
+                                                                    color="primary",
+                                                                    size="sm",
+                                                                    outline=True,
+                                                                    className="shadow-sm",
+                                                                )
+                                                            ],
+                                                            width=4,
+                                                            className="text-end",
+                                                        ),
+                                                    ]
+                                                )
+                                            ],
+                                            className="bg-light border-0",
+                                        ),
+                                        dbc.CardBody(
+                                            [
+                                                html.Div(
+                                                    id="data-summary",
+                                                    children="No data loaded",
+                                                )
+                                            ],
+                                            className="p-3",
+                                        ),
+                                    ],
+                                    className="shadow-sm border-0 h-100",
+                                )
                             )
                         ],
                         width=12,
@@ -498,6 +509,7 @@ def create_main_dashboard_layout():
             # Store components for data
             dcc.Store(id="data-store"),
             dcc.Store(id="layout-store"),
+            dcc.Store(id="temp-file-path-store"),
             dcc.Store(id="filter-params-store"),  # Replaced filtered-data-store
             dcc.Store(id="selected-turbine-store"),
         ],
