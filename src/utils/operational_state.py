@@ -427,7 +427,7 @@ class OperationalStateClassifier:
                 "state_reason",
             ]:
                 data[col] = pd.NA
-            data["is_producing"] = False
+            data["is_producing"] = pd.NA  # Unknown production status
             return data
 
         # Work on a copy
@@ -444,6 +444,7 @@ class OperationalStateClassifier:
         df = self._pre_calculate_wind_sensor_assessment(df)
 
         # Define base conditions
+        cond_data_missing = df["wtc_ActPower_min"].isna()
         cond_producing = df["wtc_ActPower_min"] > PRODUCTION_THRESHOLD_KW
         cond_alarm = df["EffectiveAlarmTime"] > ALARM_THRESHOLD_SECONDS
         cond_curtail_ext = df["wtc_PowerRed_timeon"] > CURTAILMENT_THRESHOLD_SECONDS
@@ -462,29 +463,39 @@ class OperationalStateClassifier:
 
         # Hierarchical conditions for np.select
         conditions = [
-            cond_producing,
-            ~cond_producing & cond_alarm,
-            ~cond_producing & ~cond_alarm & cond_curtailment,
-            ~cond_producing & ~cond_alarm & ~cond_curtailment & cond_sensor_error,
-            ~cond_producing
+            cond_data_missing & cond_alarm,
+            cond_data_missing & ~cond_alarm,
+            ~cond_data_missing & cond_producing,
+            ~cond_data_missing & ~cond_producing & cond_alarm,
+            ~cond_data_missing & ~cond_producing & ~cond_alarm & cond_curtailment,
+            ~cond_data_missing
+            & ~cond_producing
+            & ~cond_alarm
+            & ~cond_curtailment
+            & cond_sensor_error,
+            ~cond_data_missing
+            & ~cond_producing
             & ~cond_alarm
             & ~cond_curtailment
             & ~cond_sensor_error
             & cond_confirmed_low_wind,
-            ~cond_producing
+            ~cond_data_missing
+            & ~cond_producing
             & ~cond_alarm
             & ~cond_curtailment
             & ~cond_sensor_error
             & ~cond_confirmed_low_wind
             & cond_startup_post_lw,
-            ~cond_producing
+            ~cond_data_missing
+            & ~cond_producing
             & ~cond_alarm
             & ~cond_curtailment
             & ~cond_sensor_error
             & ~cond_confirmed_low_wind
             & ~cond_startup_post_lw
             & cond_startup_post_alarm,
-            ~cond_producing
+            ~cond_data_missing
+            & ~cond_producing
             & ~cond_alarm
             & ~cond_curtailment
             & ~cond_sensor_error
@@ -492,7 +503,8 @@ class OperationalStateClassifier:
             & ~cond_startup_post_lw
             & ~cond_startup_post_alarm
             & cond_suspected_low_wind,
-            ~cond_producing
+            ~cond_data_missing
+            & ~cond_producing
             & ~cond_alarm
             & ~cond_curtailment
             & ~cond_sensor_error
@@ -507,6 +519,8 @@ class OperationalStateClassifier:
         O_S = OPERATIONAL_STATES  # Alias
 
         choices_op_state = [
+            "DATA_MISSING",
+            "DATA_MISSING",
             "PRODUCING",
             "NOT_PRODUCING_EXPLAINED",
             "NOT_PRODUCING_EXPLAINED",
@@ -518,6 +532,8 @@ class OperationalStateClassifier:
             "NOT_PRODUCING_UNEXPECTED",
         ]
         choices_category = [
+            O_S["DATA_MISSING"]["name"],
+            O_S["DATA_MISSING"]["name"],
             O_S["PRODUCING"]["name"],
             O_S["NOT_PRODUCING_EXPLAINED"]["name"],
             O_S["NOT_PRODUCING_EXPLAINED"]["name"],
@@ -538,6 +554,8 @@ class OperationalStateClassifier:
         )
 
         choices_subcategory = [
+            O_S["DATA_MISSING"]["subcategories"]["WITH_ALARM"],
+            O_S["DATA_MISSING"]["subcategories"]["NO_ALARM"],
             O_S["PRODUCING"]["subcategory"],
             O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["ALARM_ACTIVE"],
             O_S["NOT_PRODUCING_EXPLAINED"]["subcategories"]["CURTAILMENT_ACTIVE"],
@@ -553,15 +571,17 @@ class OperationalStateClassifier:
             ],
         ]
         choices_is_producing = [
-            True,
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
+            pd.NA,  # Data missing with alarm - production status unknown
+            pd.NA,  # Data missing without alarm - production status unknown
+            True,  # Producing
+            False,  # Not producing - alarm active
+            False,  # Not producing - curtailment
+            False,  # Not producing - sensor error
+            False,  # Not producing - confirmed low wind
+            False,  # Not producing - startup post low wind
+            False,  # Not producing - startup post alarm
+            False,  # Not producing - suspected low wind
+            False,  # Not producing - sufficient wind (mechanical issue)
         ]
 
         # Default choices
@@ -570,7 +590,7 @@ class OperationalStateClassifier:
         default_subcat = O_S["NOT_PRODUCING_UNEXPECTED"]["subcategories"][
             "UNKNOWN_NON_PRODUCTION"
         ]
-        default_prod = False
+        default_prod = pd.NA  # Unknown production status for default case
 
         df["operational_state"] = np.select(
             conditions, choices_op_state, default=default_op_state
@@ -581,11 +601,18 @@ class OperationalStateClassifier:
         df["state_subcategory"] = np.select(
             conditions, choices_subcategory, default=default_subcat
         )
-        df["is_producing"] = np.select(
-            conditions, choices_is_producing, default=default_prod
+        # Use np.select for is_producing, then convert to pandas nullable boolean type
+        df["is_producing"] = pd.Series(
+            np.select(conditions, choices_is_producing, default=default_prod),
+            dtype="boolean",  # pandas nullable boolean type that can handle NA values
+            index=df.index,
         )
 
         # Reason strings
+        reason_missing_with_alarm = (
+            "Power data (wtc_ActPower_min) missing with active alarm."
+        )
+        reason_missing_no_alarm = "Power data (wtc_ActPower_min) missing with no alarm."
         reason_producing = (
             "Minimum Power output: "
             + df["wtc_ActPower_min"].round(1).astype(str)
@@ -620,6 +647,8 @@ class OperationalStateClassifier:
         )
 
         choices_reason = [
+            reason_missing_with_alarm,
+            reason_missing_no_alarm,
             reason_producing,
             reason_alarm,
             reason_curtailment,
@@ -633,6 +662,9 @@ class OperationalStateClassifier:
         df["state_reason"] = np.select(
             conditions, choices_reason, default=default_reason_str
         )
+
+        # Final cleanup for any string representations of NaN, etc.
+        df["state_reason"] = df["state_reason"].fillna("No specific reason generated.")
 
         # Clean up temporary columns (adjust list as needed)
         temp_cols = [

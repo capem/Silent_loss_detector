@@ -306,10 +306,10 @@ def create_combined_investigation_chart(
     # --- Row 2: Operational State ---
     state_colors = {
         "PRODUCING": "green",
-        "NOT_PRODUCING_EXPLAINED": "gold",  # Changed from yellow for better visibility
+        "NOT_PRODUCING_EXPLAINED": "gold",
         "NOT_PRODUCING_VERIFICATION_PENDING": "orange",
         "NOT_PRODUCING_UNEXPECTED": "red",
-        "OFFLINE_MAINTENANCE": "gray",
+        "DATA_MISSING": "gray",
     }
     for state, color in state_colors.items():
         state_data = turbine_data[turbine_data["operational_state"] == state]

@@ -89,6 +89,15 @@ OPERATIONAL_STATES = {
         "subcategory": "Maintenance Mode",
         "color": "#6c757d",  # Gray
     },
+    "DATA_MISSING": {
+        "code": 6,
+        "name": "Data Missing",
+        "subcategories": {
+            "WITH_ALARM": "Data Missing (Alarm Active)",
+            "NO_ALARM": "Data Missing (No Alarm)",
+        },
+        "color": "#adb5bd",
+    },
 }
 
 # UI Configuration

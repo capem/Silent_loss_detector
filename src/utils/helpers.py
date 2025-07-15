@@ -55,7 +55,7 @@ def calculate_availability(data: pd.DataFrame, station_id: str = None) -> Dict[s
     explained_stop = len(turbine_data[turbine_data['operational_state'] == 'NOT_PRODUCING_EXPLAINED'])
     verification_pending = len(turbine_data[turbine_data['operational_state'] == 'NOT_PRODUCING_VERIFICATION_PENDING'])
     unexpected_stop = len(turbine_data[turbine_data['operational_state'] == 'NOT_PRODUCING_UNEXPECTED'])
-    offline = len(turbine_data[turbine_data['operational_state'] == 'OFFLINE_MAINTENANCE'])
+    data_missing = len(turbine_data[turbine_data['operational_state'] == 'DATA_MISSING'])
     
     return {
         'total_records': total_records,
@@ -63,7 +63,7 @@ def calculate_availability(data: pd.DataFrame, station_id: str = None) -> Dict[s
         'explained_stop_pct': (explained_stop / total_records) * 100,
         'verification_pending_pct': (verification_pending / total_records) * 100,
         'unexpected_stop_pct': (unexpected_stop / total_records) * 100,
-        'offline_pct': (offline / total_records) * 100,
+        'data_missing_pct': (data_missing / total_records) * 100,
         'availability_pct': ((producing + explained_stop) / total_records) * 100,
         'unexplained_loss_pct': ((verification_pending + unexpected_stop) / total_records) * 100
     }
