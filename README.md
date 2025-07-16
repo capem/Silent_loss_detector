@@ -19,7 +19,7 @@ A comprehensive Plotly Dash application for investigating wind turbines that are
      - **Not Producing - Explained**: Alarm active, curtailment, confirmed low wind, startup sequences
      - **Not Producing - Verification Pending**: Suspected low wind, unclear startup
      - **Not Producing - Unexpected**: Sensor errors, mechanical issues, unknown causes
-     - **Offline/Maintenance**: Maintenance mode
+     - **Data Missing**: Data Missing
    - Configurable thresholds and parameters
    - Historical context analysis for startup sequences
 

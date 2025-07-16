@@ -83,14 +83,8 @@ OPERATIONAL_STATES = {
         },
         "color": "#dc3545",  # Red
     },
-    "OFFLINE_MAINTENANCE": {
-        "code": 5,
-        "name": "Offline/Maintenance",
-        "subcategory": "Maintenance Mode",
-        "color": "#6c757d",  # Gray
-    },
     "DATA_MISSING": {
-        "code": 6,
+        "code": 5,
         "name": "Data Missing",
         "subcategories": {
             "WITH_ALARM": "Data Missing (Alarm Active)",
